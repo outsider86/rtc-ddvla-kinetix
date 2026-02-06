@@ -7,8 +7,8 @@ Simulated experiments for the papers [Real-Time Execution of Action Chunking Flo
 git submodule update --init
 # Install uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
-# Install dependencies
-uv sync
+# Install dependencies (Python 3.12 recommended - dm-tree wheels unavailable for 3.13)
+uv sync --python 3.12
 ```
 
 ## Pre-trained checkpoints and data
