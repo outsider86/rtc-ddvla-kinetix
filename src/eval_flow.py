@@ -42,7 +42,7 @@ class BIDMethodConfig:
 class EvalConfig:
     step: int = -1
     weak_step: int | None = None
-    num_evals: int = 2048
+    num_evals: int = 128  # Lowered from 2048 for ~16GB VRAM; use --config.num-evals 2048 for paper reproducibility
     num_flow_steps: int = 5
 
     inference_delay: int = 0
