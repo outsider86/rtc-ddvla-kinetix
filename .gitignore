@@ -217,3 +217,5 @@ tags
 
 wandb/
 rtc-assets/
+train_logs/
+eval_logs/

@@ -2,6 +2,9 @@
 requires = ["setuptools>=64.0"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.packages.find]
+include = ["visualization*"]
+
 [project]
 name = "real-time-chunking-kinetix"
 version = "0.0.1"
@@ -18,8 +21,12 @@ dependencies = [
     "pandas",
     "tqdm-loggable",
     "kinetix",
+    "matplotlib",
+    "seaborn",
 ]
 
+[project.scripts]
+plot-eval-results = "visualization.plot_results:main"
 
 [tool.ruff]
 line-length = 120
