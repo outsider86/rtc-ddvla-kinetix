@@ -74,7 +74,15 @@ def main(config: Config):
 
     env = kenv.make_kinetix_env_from_name("Kinetix-Symbolic-Continuous-v1", static_env_params=static_env_params)
 
-    mesh = jax.make_mesh((jax.local_device_count(),), ("level",))
+    num_levels = len(config.level_paths)
+    num_devices = jax.local_device_count()
+    if num_levels % num_devices != 0:
+        raise ValueError(
+            f"Number of levels ({num_levels}) must be divisible by number of GPUs ({num_devices}). "
+            "Use --config.level-paths to select a compatible subset (e.g. 1, 2, 4, 6, or 12 for 2 GPUs)."
+        )
+
+    mesh = jax.make_mesh((num_devices,), ("level",))
     sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("level"))
 
     action_chunk_size = config.eval.model.action_chunk_size
