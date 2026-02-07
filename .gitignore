@@ -219,3 +219,7 @@ wandb/
 rtc-assets/
 train_logs/
 eval_logs/
+# Training and evaluation logs (keep results like eval_dd_output/ for commit)
+logs-dd/
+logs-expert/
+logs-bc/

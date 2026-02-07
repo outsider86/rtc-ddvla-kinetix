@@ -1,3 +1,5 @@
+"""Training script for Discrete Diffusion policies. Mirrors train_flow pipeline."""
+
 import concurrent.futures
 import dataclasses
 import functools
@@ -11,17 +13,17 @@ import flax.nnx as nnx
 import imageio
 import jax
 import jax.numpy as jnp
-import kinetix.environment.env as kenv
-import kinetix.environment.env_state as kenv_state
+import kinetix.environment.env as kenv                  # type: ignore
+import kinetix.environment.env_state as kenv_state      # type: ignore
 import numpy as np
 import optax
 import tqdm_loggable.auto as tqdm
 import tyro
 import wandb
 
-import model_dd as _model_dd
-import eval_dd as _eval
+import eval_flow as _eval
 import generate_data
+import model_dd as _model_dd
 import train_expert
 
 WANDB_PROJECT = "rtc-kinetix-dd"
@@ -49,12 +51,19 @@ class Config:
     num_epochs: int = 32
     seed: int = 0
 
-    eval: _eval.EvalConfig = dataclasses.field(default_factory=_eval.EvalConfig)
+    # Eval during training: same structure as eval_flow.EvalConfig but with model_dd.ModelConfig
+    eval_num_evals: int = 2048
+    eval_num_flow_steps: int = 5
+    eval_inference_delay: int = 0
+    eval_execute_horizon: int = 1
+    eval_model: _model_dd.ModelConfig = dataclasses.field(default_factory=_model_dd.ModelConfig)
 
     learning_rate: float = 3e-4
     grad_norm_clip: float = 10.0
     weight_decay: float = 1e-2
-    lr_warmup_steps: int = 1000
+    lr_warmup_steps: int = 2000
+    use_cosine_decay: bool = True
+    lr_min: float = 1e-5
 
     load_dir: str | None = None
 
@@ -66,6 +75,18 @@ class EpochCarry:
     graphdef: nnx.GraphDef[tuple[_model_dd.DiscreteDiffusionPolicy, nnx.Optimizer]]
 
 
+def _make_eval_config(config: Config, execute_horizon: int) -> _eval.EvalConfig:
+    """Build eval_flow.EvalConfig for a given execute_horizon (eval() only uses scalar fields)."""
+    return _eval.EvalConfig(
+        num_evals=config.eval_num_evals,
+        num_flow_steps=config.eval_num_flow_steps,
+        inference_delay=config.eval_inference_delay,
+        execute_horizon=execute_horizon,
+        method=_eval.NaiveMethodConfig(),
+        model=config.eval_model,  # type: ignore[arg-type]  # eval() does not use config.model
+    )
+
+
 def main(config: Config):
     static_env_params = kenv_state.StaticEnvParams(**train_expert.LARGE_ENV_PARAMS, frame_skip=train_expert.FRAME_SKIP)
     env_params = kenv_state.EnvParams()
@@ -74,20 +95,12 @@ def main(config: Config):
 
     env = kenv.make_kinetix_env_from_name("Kinetix-Symbolic-Continuous-v1", static_env_params=static_env_params)
 
-    num_levels = len(config.level_paths)
-    num_devices = jax.local_device_count()
-    if num_levels % num_devices != 0:
-        raise ValueError(
-            f"Number of levels ({num_levels}) must be divisible by number of GPUs ({num_devices}). "
-            "Use --config.level-paths to select a compatible subset (e.g. 1, 2, 4, 6, or 12 for 2 GPUs)."
-        )
-
-    mesh = jax.make_mesh((num_devices,), ("level",))
+    mesh = jax.make_mesh((jax.local_device_count(),), ("level",))
     sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("level"))
 
-    action_chunk_size = config.eval.model.action_chunk_size
+    action_chunk_size = config.eval_model.action_chunk_size
 
-    # load data
+    # load data (same as train_flow)
     def load_data(level_path: str):
         level_name = level_path.replace("/", "_").replace(".json", "")
         print("Loading data for level:", level_name)
@@ -96,15 +109,11 @@ def main(config: Config):
     with concurrent.futures.ThreadPoolExecutor() as executor:
         data = list(executor.map(load_data, config.level_paths))
     with jax.default_device(jax.devices("cpu")[0]):
-        # data has shape: (num_levels, num_steps, num_envs, ...)
-        # flatten envs and steps together for learning
         data = jax.tree.map(lambda *x: einops.rearrange(jnp.stack(x), "l s e ... -> l (e s) ..."), *data)
-        # truncate to multiple of batch size
         valid_steps = data["obs"].shape[1] - action_chunk_size + 1
         data = jax.tree.map(
             lambda x: x[:, : (valid_steps // config.batch_size) * config.batch_size + action_chunk_size - 1], data
         )
-        # put on device
         data = jax.tree.map(
             lambda x: jax.make_array_from_single_device_arrays(
                 x.shape,
@@ -133,14 +142,19 @@ def main(config: Config):
     else:
         state_dicts = None
 
-    @functools.partial(jax.jit, in_shardings=sharding, out_shardings=sharding)
+    @functools.partial(
+        jax.jit,
+        in_shardings=(sharding, sharding),
+        out_shardings=sharding,
+        static_argnums=(2,),
+    )
     @jax.vmap
-    def init(rng: jax.Array, state_dict: dict | None) -> EpochCarry:
+    def init(rng: jax.Array, state_dict: dict | None, total_steps: int) -> EpochCarry:
         rng, key = jax.random.split(rng)
         policy = _model_dd.DiscreteDiffusionPolicy(
             obs_dim=obs_dim,
             action_dim=action_dim,
-            config=config.eval.model,
+            config=config.eval_model,
             rngs=nnx.Rngs(key),
         )
         if state_dict is not None:
@@ -149,14 +163,24 @@ def main(config: Config):
             policy = nnx.merge(graphdef, state)
         total_params = sum(x.size for x in jax.tree.leaves(nnx.state(policy, nnx.Param)))
         print(f"Total params: {total_params:,}")
+        if config.use_cosine_decay:
+            decay_steps = max(1, total_steps - config.lr_warmup_steps)
+            lr_schedule = optax.warmup_cosine_decay_schedule(
+                0.0,
+                config.learning_rate,
+                config.lr_warmup_steps,
+                decay_steps,
+                config.lr_min,
+            )
+        else:
+            lr_schedule = optax.warmup_constant_schedule(
+                0, config.learning_rate, config.lr_warmup_steps
+            )
         optimizer = nnx.Optimizer(
             policy,
             optax.chain(
                 optax.clip_by_global_norm(config.grad_norm_clip),
-                optax.adamw(
-                    optax.warmup_constant_schedule(0, config.learning_rate, config.lr_warmup_steps),
-                    weight_decay=config.weight_decay,
-                ),
+                optax.adamw(lr_schedule, weight_decay=config.weight_decay),
             ),
         )
         graphdef, train_state = nnx.split((policy, optimizer))
@@ -174,7 +198,6 @@ def main(config: Config):
             def loss_fn(policy: _model_dd.DiscreteDiffusionPolicy):
                 obs = data.obs[batch_idxs]
                 action_chunks = data.action[batch_idxs[:, None] + jnp.arange(action_chunk_size)[None, :]]
-                # zero actions after done
                 done_chunks = data.done[batch_idxs[:, None] + jnp.arange(action_chunk_size)[None, :]]
                 done_idxs = jnp.where(
                     jnp.any(done_chunks, axis=-1),
@@ -194,32 +217,40 @@ def main(config: Config):
             _, train_state = nnx.split((policy, optimizer))
             return (rng, train_state), info
 
-        # shuffle
         rng, key = jax.random.split(epoch_carry.rng)
         permutation = jax.random.permutation(key, data.obs.shape[0] - action_chunk_size + 1)
-        # batch
         permutation = permutation.reshape(-1, config.batch_size)
-        # train
         (rng, train_state), train_info = jax.lax.scan(
             train_minibatch, (epoch_carry.rng, epoch_carry.train_state), permutation
         )
         train_info = jax.tree.map(lambda x: x.mean(), train_info)
-        # eval (DiscreteDiffusionPolicy has same interface as FlowPolicy)
+        # Eval: same interface as FlowPolicy (action, realtime_action, bid_action)
         rng, key = jax.random.split(rng)
         eval_policy, _ = nnx.merge(epoch_carry.graphdef, train_state)
         eval_info = {}
-        for horizon in range(1, config.eval.model.action_chunk_size + 1):
-            eval_config = dataclasses.replace(config.eval, execute_horizon=horizon)
-            info, _ = _eval.eval(eval_config, env, key, level, eval_policy, env_params, static_env_params)
+        for horizon in range(1, action_chunk_size + 1):
+            eval_config = _make_eval_config(config, horizon)
+            info, _ = _eval.eval(
+                eval_config, env, key, level, eval_policy, env_params, static_env_params  # type: ignore[arg-type]
+            )
             eval_info.update({f"{k}_{horizon}": v for k, v in info.items()})
         video = None
         return EpochCarry(rng, train_state, epoch_carry.graphdef), ({**train_info, **eval_info}, video)
 
+    num_batches = valid_steps // config.batch_size
+    total_steps = config.num_epochs * num_batches
+
     wandb.init(project=WANDB_PROJECT)
     rng = jax.random.key(config.seed)
-    epoch_carry = init(jax.random.split(rng, len(config.level_paths)), state_dicts)
+    epoch_carry = init(
+        jax.random.split(rng, len(config.level_paths)), state_dicts, total_steps
+    )
     for epoch_idx in tqdm.tqdm(range(config.num_epochs)):
         epoch_carry, (info, video) = train_epoch(epoch_carry, levels, data)
+        # Pull to host before indexing to avoid NCCL/gather on sharded arrays
+        info = jax.device_get(info)
+        video = jax.device_get(video) if video is not None else None
+        train_state_host = jax.device_get(epoch_carry.train_state)
 
         for i in range(len(config.level_paths)):
             level_name = config.level_paths[i].replace("/", "_").replace(".json", "")
@@ -234,7 +265,7 @@ def main(config: Config):
 
             policy_dir = log_dir / "policies"
             policy_dir.mkdir(parents=True, exist_ok=True)
-            level_train_state = jax.tree.map(lambda x: x[i], epoch_carry.train_state)
+            level_train_state = jax.tree.map(lambda x: x[i], train_state_host)
             with (policy_dir / f"{level_name}.pkl").open("wb") as f:
                 policy, _ = nnx.merge(epoch_carry.graphdef, level_train_state)
                 state_dict = nnx.state(policy).to_pure_dict()

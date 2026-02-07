@@ -124,6 +124,15 @@ def plot_delay_vs_success_by_method(
     for method in agg["method"].unique():
         sub = agg[agg["method"] == method].sort_values("delay")
         ax.plot(sub["delay"], sub[metric], marker="o", label=method)
+        for _, row in sub.iterrows():
+            ax.annotate(
+                f"{row[metric]:.2f}",
+                (row["delay"], row[metric]),
+                textcoords="offset points",
+                xytext=(0, 6),
+                ha="center",
+                fontsize=8,
+            )
     ax.set_xlabel("inference_delay")
     ax.set_ylabel("success rate" if metric == "returned_episode_solved" else metric)
     ax.set_title(f"Success rate vs inference_delay (execute_horizon=max(1, delay))")

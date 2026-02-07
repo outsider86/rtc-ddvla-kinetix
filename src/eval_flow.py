@@ -10,10 +10,10 @@ import flax.nnx as nnx
 import jax
 from jax.experimental import shard_map
 import jax.numpy as jnp
-import kinetix.environment.env as kenv
-import kinetix.environment.env_state as kenv_state
-import kinetix.environment.wrappers as wrappers
-import kinetix.render.renderer_pixels as renderer_pixels
+import kinetix.environment.env as kenv                       # type: ignore
+import kinetix.environment.env_state as kenv_state           # type: ignore
+import kinetix.environment.wrappers as wrappers              # type: ignore
+import kinetix.render.renderer_pixels as renderer_pixels     # type: ignore
 import pandas as pd
 import tyro
 
@@ -42,7 +42,7 @@ class BIDMethodConfig:
 class EvalConfig:
     step: int = -1
     weak_step: int | None = None
-    num_evals: int = 128  # Lowered from 2048 for ~16GB VRAM; use --config.num-evals 2048 for paper reproducibility
+    num_evals: int = 2048  # Lowered from 2048 for ~16GB VRAM; use --config.num-evals 2048 for paper reproducibility
     num_flow_steps: int = 5
 
     inference_delay: int = 0
