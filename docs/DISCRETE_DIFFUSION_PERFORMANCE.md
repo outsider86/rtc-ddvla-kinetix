@@ -18,8 +18,8 @@ This doc focuses on **model_dd.py**, **train_dd.py**, and **eval_dd.py**. Use it
 |--------|--------|------------|
 | **Capacity** | `ModelConfig` | Increase `num_layers` (e.g. 6–8), `channel_dim` (e.g. 384), `channel_hidden_dim` (e.g. 768). Start with one at a time. |
 | **Action resolution** | `num_bins` | 256 is standard. Try 128 (faster, less overfitting) or 512 (finer control, more capacity). |
-| **RTC-style training** | `simulated_delay` | Set to a small value (e.g. 1–2) so some batches train with a “prefix” of known actions; helps realtime_action at delay > 0. |
-| **Inpainting masking** | `inpainting_masking` | Keep True when using `simulated_delay` so the first `d` steps are never masked (matches ref.py RTC). |
+| **RTC-style training** | `simulated_delay` | Set to True to never mask the first d steps (d random in 1..chunk_size//2); helps realtime_action at delay > 0. |
+ Set to a small value (e.g. 1–2) so some batches train with a “prefix” of known actions; helps realtime_action at delay > 0. |
 | **Train mask schedule** | `train_mask_schedule` | Default "cosine" is good; try "linear" for ablations. |
 | **No-mask token prob** | `no_mask_token_prob` | Small value (e.g. 0.05–0.1) can reduce overfitting to always-masked; ref uses this. |
 
@@ -60,7 +60,7 @@ This doc focuses on **model_dd.py**, **train_dd.py**, and **eval_dd.py**. Use it
 
 ## 6. Quick wins to try first
 
-1. **Enable RTC-style training**: Set `simulated_delay=1` or `2` in `ModelConfig` (or via `train_dd.Config.eval_model`), keep `inpainting_masking=True`.
+1. **Enable RTC-style training**: Set `simulated_delay=True` in `ModelConfig` (or via `train_dd.Config.eval_model`).
 2. **More decode steps at eval**: Set `num_flow_steps=8` or `10` in `EvalConfig` and in training’s `eval_num_flow_steps`.
 3. **Cosine LR decay**: Replace constant LR after warmup with cosine decay to 1e-5 or 1e-6 over the rest of training.
 4. **Slightly larger model**: e.g. `num_layers=6`, `channel_dim=320` without changing data pipeline.
@@ -71,7 +71,7 @@ This doc focuses on **model_dd.py**, **train_dd.py**, and **eval_dd.py**. Use it
 
 1. Baseline: current config, log solve rate and loss.
 2. Add **cosine LR decay**; re-run same epochs.
-3. Add **simulated_delay=1** (and inpainting_masking=True); compare realtime vs naive at delay 1–2.
+3. Add **simulated_delay=True**; compare realtime vs naive at delay 1–2.
 4. Increase **num_flow_steps** at eval to 8; compare solve rate vs latency.
 5. Ablate **use_remask** True vs False at eval.
 6. Scale model (**num_layers** / **channel_dim**) if still underfitting.
@@ -81,6 +81,6 @@ This doc focuses on **model_dd.py**, **train_dd.py**, and **eval_dd.py**. Use it
 - **Cosine LR decay**:  
   `python -m train_dd --run-path ... --use-cosine-decay --lr-min 1e-5`
 - **RTC-style training** (prefix masking):  
-  Pass a model config with `simulated_delay`; e.g. with a small wrapper or by extending the CLI, set `eval_model.simulated_delay=1` (e.g. `--eval_model.simulated_delay 1` if your CLI supports nested fields). Keeping `inpainting_masking=True` (default) matches ref.py.
+  Pass a model config with `simulated_delay=True`; e.g. set `eval_model.simulated_delay true` via CLI if supported.
 - **More decode steps during training eval**:  
   `--eval-num-flow-steps 8`

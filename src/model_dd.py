@@ -88,11 +88,10 @@ class ModelConfig:
     num_layers: int = 4
     action_chunk_size: int = 8
     num_bins: int = 512
-    simulated_delay: int | None = None
-    # Training-time masking (ref.py): schedule for mask ratio, no_mask_token_prob, RTC first-d
+    inpainting_mask: bool = True  # If True, never mask the first d actions (d random in 0..action_chunk_size//2), like inpainting/RTC.
+    # Training-time masking (ref.py): schedule for mask ratio, no_mask_token_prob
     train_mask_schedule: Literal["cosine", "linear"] = "cosine"
     no_mask_token_prob: float = 0.0
-    inpainting_masking: bool = False  # If True, never mask the first d steps (ref: rtc_masking)
     # Decode (realtime_decode-style): schedule and temperature
     decode_schedule: Literal["cosine", "linear"] = "cosine"
     choice_temperature: float = 1.0
@@ -114,10 +113,9 @@ class DiscreteDiffusionPolicy(nnx.Module):
         self.action_dim = action_dim
         self.action_chunk_size = config.action_chunk_size
         self.num_bins = config.num_bins
-        self.simulated_delay = config.simulated_delay
+        self.inpainting_mask = config.inpainting_mask
         self.train_mask_schedule = config.train_mask_schedule
         self.no_mask_token_prob = config.no_mask_token_prob
-        self.inpainting_masking = config.inpainting_masking
         self.decode_schedule = config.decode_schedule
         self.choice_temperature = config.choice_temperature
         self.use_remask = config.use_remask
@@ -352,17 +350,16 @@ class DiscreteDiffusionPolicy(nnx.Module):
         Returns masked_tokens: same shape; masked positions set to IGNORE_TOKEN, rest unchanged.
         """
         B, L = input_tokens.shape[0], self.action_chunk_size * self.action_dim
-        rng, time_rng, vals_rng, unmask_rng, delay_rng, rtc_rng = jax.random.split(rng, 6)
-        # 1) Which positions can be masked (ref: loss_mask_full)
-        if self.simulated_delay is not None:
-            w = jnp.exp(jnp.arange(0, self.simulated_delay)[::-1])
-            w = w / jnp.sum(w)
-            delay = jax.random.choice(delay_rng, self.simulated_delay, (B,), p=w)
-            prefix_mask = (jnp.arange(self.action_chunk_size)[None, :] < delay[:, None])[:, :, None]
-            loss_mask_full = ~prefix_mask
+        rng, time_rng, vals_rng, unmask_rng, d_rng = jax.random.split(rng, 5)
+        # 1) Which positions can be masked (ref: loss_mask_full). When inpainting_mask=True, never mask the first d actions (d in 0..chunk_size//2; d=0 => all maskable).
+        if self.inpainting_mask:
+            d = jax.random.randint(d_rng, (), 0, self.action_chunk_size // 2 + 1)
+            # Use comparison instead of slice so d can be dynamic under JIT
+            loss_mask_full = (jnp.arange(self.action_chunk_size) >= d)[None, :, None]
         else:
             loss_mask_full = jnp.ones((B, self.action_chunk_size, self.action_dim), dtype=bool)
         total_unknown = jnp.sum(loss_mask_full.astype(jnp.float32), axis=(1, 2))
+
         # 2) Random time -> schedule -> mask_ratio -> num_mask (ref: steps 2–3)
         rand_time = jax.random.uniform(time_rng, (B,))
         mask_ratios = _train_mask_schedule(rand_time, self.train_mask_schedule)
@@ -372,6 +369,7 @@ class DiscreteDiffusionPolicy(nnx.Module):
             L,
         )
         num_mask = jnp.where(total_unknown > 0, num_mask, 0)
+
         # 3) Top-k by random score among loss_mask_full -> masked_mask (ref: steps 4–5)
         vals = jax.random.uniform(vals_rng, (B, self.action_chunk_size, self.action_dim))
         vals = jnp.where(loss_mask_full, vals, jnp.float32("inf"))
@@ -385,11 +383,6 @@ class DiscreteDiffusionPolicy(nnx.Module):
             prob = jax.random.uniform(unmask_rng, masked_mask.shape)
             unmask = (prob < self.no_mask_token_prob) & masked_mask
             masked_mask = masked_mask & ~unmask
-        # 5) Optional inpainting_masking: never mask the first d steps (ref: rtc_masking)
-        if self.simulated_delay is not None and self.inpainting_masking:
-            d = jax.random.randint(rtc_rng, (), 1, self.action_chunk_size // 2 + 1)
-            first_d_mask = jnp.arange(self.action_chunk_size)[None, :, None] >= d
-            masked_mask = masked_mask & first_d_mask
         masked_tokens = jnp.where(masked_mask, IGNORE_TOKEN, input_tokens)
         return masked_tokens
 

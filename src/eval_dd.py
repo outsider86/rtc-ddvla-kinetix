@@ -239,7 +239,10 @@ def run_eval_chunk(
 
     rows: list[dict] = []
     for inference_delay in [0, 1, 2, 3, 4]:
-        for execute_horizon in range(max(1, inference_delay), action_chunk_size - inference_delay + 1):
+        execute_horizon_min = max(1, inference_delay)
+        # execute_horizon_max = action_chunk_size - inference_delay
+        execute_horizon_max = execute_horizon_min
+        for execute_horizon in range(execute_horizon_min, execute_horizon_max + 1):
             print(f"{inference_delay=} {execute_horizon=}")
             c = dataclasses.replace(
                 config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=NaiveMethodConfig()

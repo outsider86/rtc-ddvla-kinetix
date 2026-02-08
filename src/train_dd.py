@@ -3,6 +3,7 @@
 import concurrent.futures
 import dataclasses
 import functools
+import json
 import pathlib
 import pickle
 from typing import Sequence
@@ -142,14 +143,7 @@ def main(config: Config):
     else:
         state_dicts = None
 
-    @functools.partial(
-        jax.jit,
-        in_shardings=(sharding, sharding),
-        out_shardings=sharding,
-        static_argnums=(2,),
-    )
-    @jax.vmap
-    def init(rng: jax.Array, state_dict: dict | None, total_steps: int) -> EpochCarry:
+    def _init_body(rng: jax.Array, state_dict: dict | None, total_steps: int) -> EpochCarry:
         rng, key = jax.random.split(rng)
         policy = _model_dd.DiscreteDiffusionPolicy(
             obs_dim=obs_dim,
@@ -185,6 +179,26 @@ def main(config: Config):
         )
         graphdef, train_state = nnx.split((policy, optimizer))
         return EpochCarry(rng, train_state, graphdef)
+
+    @functools.partial(
+        jax.jit,
+        in_shardings=(sharding, None),
+        out_shardings=sharding,
+        static_argnums=(2,),
+    )
+    @functools.partial(jax.vmap, in_axes=(0, None, None))
+    def init_no_load(rng: jax.Array, state_dict: dict | None, total_steps: int) -> EpochCarry:
+        return _init_body(rng, state_dict, total_steps)
+
+    @functools.partial(
+        jax.jit,
+        in_shardings=(sharding, sharding),
+        out_shardings=sharding,
+        static_argnums=(2,),
+    )
+    @functools.partial(jax.vmap, in_axes=(0, 0, None))
+    def init_load(rng: jax.Array, state_dict: dict, total_steps: int) -> EpochCarry:
+        return _init_body(rng, state_dict, total_steps)
 
     @functools.partial(jax.jit, donate_argnums=(0,), in_shardings=sharding, out_shardings=sharding)
     @jax.vmap
@@ -241,10 +255,19 @@ def main(config: Config):
     total_steps = config.num_epochs * num_batches
 
     wandb.init(project=WANDB_PROJECT)
+    run_dir = LOG_DIR / wandb.run.name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    with (run_dir / "config.json").open("w") as f:
+        json.dump(dataclasses.asdict(config), f, indent=2)
+    with (run_dir / "model_config.json").open("w") as f:
+        json.dump(dataclasses.asdict(config.eval_model), f, indent=2)
+
     rng = jax.random.key(config.seed)
-    epoch_carry = init(
-        jax.random.split(rng, len(config.level_paths)), state_dicts, total_steps
-    )
+    rngs = jax.random.split(rng, len(config.level_paths))
+    if state_dicts is None:
+        epoch_carry = init_no_load(rngs, None, total_steps)
+    else:
+        epoch_carry = init_load(rngs, state_dicts, total_steps)
     for epoch_idx in tqdm.tqdm(range(config.num_epochs)):
         epoch_carry, (info, video) = train_epoch(epoch_carry, levels, data)
         # Pull to host before indexing to avoid NCCL/gather on sharded arrays
