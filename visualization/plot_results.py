@@ -114,13 +114,15 @@ def plot_delay_vs_success_by_method(
     output_path: str | pathlib.Path | None = None,
     show: bool = True,
 ) -> None:
-    """Line plot: x=inference_delay, y=success rate; datapoints where execute_horizon=max(1, delay); one line per method."""
+    """Line plot: x=inference_delay, y=success rate; datapoints where execute_horizon=max(1, delay); one line per method.
+    Also plots realtime with delay=0 vs execute_horizon (x-axis reference: top axis)."""
     df = df.copy()
     df["s"] = df["delay"].apply(lambda d: max(1, d))
     subset = df[df["execute_horizon"] == df["s"]].copy()
     agg = subset.groupby(["delay", "method"])[metric].mean().reset_index()
 
     fig, ax = plt.subplots(figsize=(7, 5))
+    x_ticks = sorted(agg["delay"].unique())
     for method in agg["method"].unique():
         sub = agg[agg["method"] == method].sort_values("delay")
         ax.plot(sub["delay"], sub[metric], marker="o", label=method)
@@ -133,12 +135,47 @@ def plot_delay_vs_success_by_method(
                 ha="center",
                 fontsize=8,
             )
+
+    # Realtime with delay=0, x = execute_horizon (reference: top axis)
+    rt_zero = df[(df["delay"] == 0) & (df["method"] == "realtime")].copy()
+    if not rt_zero.empty:
+        agg_rt0 = rt_zero.groupby("execute_horizon")[metric].mean().reset_index()
+        agg_rt0 = agg_rt0.sort_values("execute_horizon")
+        if len(agg_rt0) > 0:
+            ax.plot(
+                agg_rt0["execute_horizon"],
+                agg_rt0[metric],
+                marker="s",
+                linestyle="--",
+                color="gray",
+                label="realtime (delay=0, x=execute_horizon)",
+                zorder=5,
+            )
+            for _, row in agg_rt0.iterrows():
+                ax.annotate(
+                    f"{row[metric]:.2f}",
+                    (row["execute_horizon"], row[metric]),
+                    textcoords="offset points",
+                    xytext=(0, -10),
+                    ha="center",
+                    fontsize=8,
+                )
+
     ax.set_xlabel("inference_delay")
     ax.set_ylabel("success rate" if metric == "returned_episode_solved" else metric)
     ax.set_title(f"Success rate vs inference_delay (execute_horizon=max(1, delay))")
     ax.legend()
-    ax.set_xticks(sorted(agg["delay"].unique()))
+    ax.set_xticks(x_ticks)
     ax.set_ylim(0, 1.05)
+
+    # Top x-axis for the realtime (delay=0) curve: execute_horizon
+    if not rt_zero.empty and len(agg_rt0) > 0 and agg_rt0["execute_horizon"].max() > 1:
+        ax_top = ax.twiny()
+        ax_top.set_xlim(ax.get_xlim())
+        ax_top.set_xticks(agg_rt0["execute_horizon"].tolist())
+        ax_top.set_xticklabels([str(int(h)) for h in agg_rt0["execute_horizon"]])
+        ax_top.set_xlabel("execute_horizon (realtime, delay=0)")
+
     plt.tight_layout()
     if output_path:
         plt.savefig(output_path, dpi=150)

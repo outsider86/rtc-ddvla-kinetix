@@ -1,4 +1,8 @@
-"""Training script for Discrete Diffusion policies. Mirrors train_flow pipeline."""
+"""Fine-tuning script for Discrete Diffusion policies.
+
+Loads a pre-trained checkpoint and continues training with smaller LR and weight decay.
+Use for adapting models (e.g., enabling inpainting_mask) without destroying pre-trained weights.
+"""
 
 import concurrent.futures
 import dataclasses
@@ -27,13 +31,14 @@ import generate_data
 import model_dd as _model_dd
 import train_expert
 
-WANDB_PROJECT = "rtc-kinetix-dd"
-LOG_DIR = pathlib.Path("logs-dd")
+WANDB_PROJECT = "rtc-kinetix-dd-finetune"
+LOG_DIR = pathlib.Path("logs-dd-finetune")
 
 
 @dataclasses.dataclass(frozen=True)
 class Config:
     run_path: str
+    load_dir: str  # Required: path to epoch dir, e.g. logs-dd/basemodel/31
     level_paths: Sequence[str] = (
         "worlds/l/grasp_easy.json",
         "worlds/l/catapult.json",
@@ -49,24 +54,23 @@ class Config:
         "worlds/l/car_launch.json",
     )
     batch_size: int = 512
-    num_epochs: int = 32
+    num_epochs: int = 16  # Fewer epochs for fine-tuning
     seed: int = 0
 
-    # Eval during training: same structure as eval_flow.EvalConfig but with model_dd.ModelConfig
-    eval_num_evals: int = 128
-    eval_num_flow_steps: int = 8  # More decode steps → better action quality (align with eval_dd)
+    # Eval during training
+    eval_num_evals: int = 2048
+    eval_num_flow_steps: int = 5
     eval_inference_delay: int = 0
     eval_execute_horizon: int = 1
     eval_model: _model_dd.ModelConfig = dataclasses.field(default_factory=_model_dd.ModelConfig)
 
-    learning_rate: float = 3e-4
+    # Fine-tuning: smaller LR and weight decay to preserve pre-trained weights
+    learning_rate: float = 3e-5  # ~10x smaller than scratch training (3e-4)
     grad_norm_clip: float = 10.0
-    weight_decay: float = 1e-2
-    lr_warmup_steps: int = 2000
+    weight_decay: float = 1e-5  # ~1000x smaller to avoid pulling weights away
+    lr_warmup_steps: int = 500  # Shorter warmup for fine-tuning
     use_cosine_decay: bool = True
-    lr_min: float = 1e-5
-
-    load_dir: str | None = None
+    lr_min: float = 1e-6  # Slightly lower floor for fine-tuning
 
 
 @struct.dataclass
@@ -133,15 +137,44 @@ def main(config: Config):
     obs_dim = data.obs.shape[-1]
     action_dim = env.action_space(env_params).shape[0]
 
-    if config.load_dir is not None:
-        state_dicts = []
-        for level_path in config.level_paths:
-            level_name = level_path.replace("/", "_").replace(".json", "")
-            with (pathlib.Path(config.load_dir) / "policies" / f"{level_name}.pkl").open("rb") as f:
-                state_dicts.append(pickle.load(f))
-        state_dicts = jax.device_put(jax.tree.map(lambda *x: jnp.array(x), *state_dicts))
+    # Load pre-trained checkpoints (required for fine-tuning)
+    load_path = pathlib.Path(config.load_dir)
+    assert load_path.exists(), f"load_dir does not exist: {config.load_dir}"
+    state_dicts_raw = []
+    for level_path in config.level_paths:
+        level_name = level_path.replace("/", "_").replace(".json", "")
+        pkl_path = load_path / "policies" / f"{level_name}.pkl"
+        assert pkl_path.exists(), f"Missing policy checkpoint: {pkl_path}"
+        with pkl_path.open("rb") as f:
+            state_dicts_raw.append(pickle.load(f))
+    state_dicts = jax.device_put(jax.tree.map(lambda *x: jnp.array(x), *state_dicts_raw))
+
+    # Verify state dict compatibility (check first level)
+    policy_check = _model_dd.DiscreteDiffusionPolicy(
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        config=config.eval_model,
+        rngs=nnx.Rngs(jax.random.key(0)),
+    )
+    _, state_check = nnx.split(policy_check)
+    model_keys = set(state_check.to_pure_dict().keys())
+    loaded_keys = set(state_dicts_raw[0].keys())
+    if model_keys != loaded_keys:
+        missing, extra = loaded_keys - model_keys, model_keys - loaded_keys
+        if missing:
+            print(f"  WARNING: Loaded has {len(missing)} keys not in model")
+        if extra:
+            print(f"  WARNING: Model has {len(extra)} keys not in loaded state")
     else:
-        state_dicts = None
+        print("  State dict keys match model.")
+
+    # Verify fine-tuning config at startup
+    print("Fine-tuning config:")
+    print(f"  load_dir: {config.load_dir}")
+    print(f"  inpainting_mask: {config.eval_model.inpainting_mask}")
+    print(f"  learning_rate: {config.learning_rate}")
+    print(f"  weight_decay: {config.weight_decay}")
+    print(f"  lr_warmup_steps: {config.lr_warmup_steps}")
 
     def _init_body(rng: jax.Array, state_dict: dict | None, total_steps: int) -> EpochCarry:
         rng, key = jax.random.split(rng)
@@ -179,16 +212,6 @@ def main(config: Config):
         )
         graphdef, train_state = nnx.split((policy, optimizer))
         return EpochCarry(rng, train_state, graphdef)
-
-    @functools.partial(
-        jax.jit,
-        in_shardings=(sharding, None),
-        out_shardings=sharding,
-        static_argnums=(2,),
-    )
-    @functools.partial(jax.vmap, in_axes=(0, None, None))
-    def init_no_load(rng: jax.Array, state_dict: dict | None, total_steps: int) -> EpochCarry:
-        return _init_body(rng, state_dict, total_steps)
 
     @functools.partial(
         jax.jit,
@@ -264,10 +287,7 @@ def main(config: Config):
 
     rng = jax.random.key(config.seed)
     rngs = jax.random.split(rng, len(config.level_paths))
-    if state_dicts is None:
-        epoch_carry = init_no_load(rngs, None, total_steps)
-    else:
-        epoch_carry = init_load(rngs, state_dicts, total_steps)
+    epoch_carry = init_load(rngs, state_dicts, total_steps)
     for epoch_idx in tqdm.tqdm(range(config.num_epochs)):
         epoch_carry, (info, video) = train_epoch(epoch_carry, levels, data)
         # Pull to host before indexing to avoid NCCL/gather on sharded arrays

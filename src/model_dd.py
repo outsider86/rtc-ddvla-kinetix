@@ -88,14 +88,17 @@ class ModelConfig:
     num_layers: int = 4
     action_chunk_size: int = 8
     num_bins: int = 512
-    inpainting_mask: bool = True  # If True, never mask the first d actions (d random in 0..action_chunk_size//2), like inpainting/RTC.
+    inpainting_mask: bool = False  # If True, never mask the first d actions (d random in 0..action_chunk_size//2), like inpainting/RTC.
+    inpainting_d_schedule: Literal["uniform", "linear_decay"] = "linear_decay"  # "linear_decay" favors small d (more full-sequence practice)
     # Training-time masking (ref.py): schedule for mask ratio, no_mask_token_prob
     train_mask_schedule: Literal["cosine", "linear"] = "cosine"
-    no_mask_token_prob: float = 0.0
+    no_mask_token_prob: float = 0.05
     # Decode (realtime_decode-style): schedule and temperature
     decode_schedule: Literal["cosine", "linear"] = "cosine"
     choice_temperature: float = 1.0
-    use_remask: bool = False
+    use_remask: bool = False  # Re-mask low-confidence positions during decode; improves quality
+    # Weak supervision in continuous action space: L1 on masked positions (nearly correct)
+    l1_loss_weight: float = 0.1  # L1 on masked positions; set >0 (e.g. 0.1) to enable
 
 
 class DiscreteDiffusionPolicy(nnx.Module):
@@ -114,11 +117,13 @@ class DiscreteDiffusionPolicy(nnx.Module):
         self.action_chunk_size = config.action_chunk_size
         self.num_bins = config.num_bins
         self.inpainting_mask = config.inpainting_mask
+        self.inpainting_d_schedule = config.inpainting_d_schedule
         self.train_mask_schedule = config.train_mask_schedule
         self.no_mask_token_prob = config.no_mask_token_prob
         self.decode_schedule = config.decode_schedule
         self.choice_temperature = config.choice_temperature
         self.use_remask = config.use_remask
+        self.l1_loss_weight = config.l1_loss_weight
         # Mask token index: positions with this value (or IGNORE_TOKEN in input) are "to be predicted".
         self.mask_token_id = config.num_bins
 
@@ -288,12 +293,11 @@ class DiscreteDiffusionPolicy(nnx.Module):
         num_steps: int,
         prev_action_chunk: jax.Array,
         inference_delay: int,
-        prefix_attention_horizon: int | None = None,
-        prefix_attention_schedule: PrefixAttentionSchedule = "exp",
-        max_guidance_weight: float = 5.0,
+        execute_horizon: int | None = None,
+        early_stop: bool = False,
     ) -> jax.Array:
         """MaskGIT-style decode with fixed prefix (ref realtime_decode). Prefix = first inference_delay steps; rest gradual unmask.
-        Extra args (prefix_attention_horizon, prefix_attention_schedule, max_guidance_weight) kept for eval_dd API compatibility; unused.
+        If early_stop=True and execute_horizon is set: return once the first d+s actions (d=inference_delay, s=execute_horizon) are all unmasked.
         """
         B = obs.shape[0]
         L = self.action_chunk_size * self.action_dim
@@ -307,9 +311,11 @@ class DiscreteDiffusionPolicy(nnx.Module):
         unknown_init = jnp.full(
             (B,), (self.action_chunk_size - inference_delay) * self.action_dim, dtype=jnp.int32
         )
+        use_early_stop = early_stop and execute_horizon is not None
+        d_plus_s = (inference_delay + execute_horizon) if use_early_stop else 0
 
-        def step(carry, step_idx):
-            cur_seqs, rng_state = carry
+        def do_step(carry, step_idx):
+            cur_seqs, rng_state, early_stopped = carry
             rng_state, cat_key, topk_key = jax.random.split(rng_state, 3)
             logits = self(obs, cur_seqs)
             probs = jax.nn.softmax(logits, axis=-1)
@@ -338,9 +344,31 @@ class DiscreteDiffusionPolicy(nnx.Module):
             next_seqs = jnp.where(
                 prefix_mask, prefix_bins, jnp.where(action_mask, self.mask_token_id, sampled)
             )
-            return (next_seqs, rng_state), None
+            if use_early_stop:
+                any_masked = jnp.any(next_seqs[:, :d_plus_s, :] == self.mask_token_id, axis=(1, 2))
+                all_unmasked = ~jnp.any(any_masked)
+                early_stopped = jnp.logical_or(early_stopped, all_unmasked)
+            else:
+                early_stopped = jnp.array(False)
+            return (next_seqs, rng_state, early_stopped), None
 
-        (cur_seqs, _), _ = jax.lax.scan(step, (cur_seqs, rng), jnp.arange(num_steps))
+        def step(carry, step_idx):
+            cur_seqs, rng_state, early_stopped = carry
+            if use_early_stop:
+                # Traced boolean: use cond to avoid TracerBoolConversionError
+                out_carry = jax.lax.cond(
+                    early_stopped,
+                    lambda c: c,
+                    lambda c: do_step(c, step_idx)[0],
+                    carry,
+                )
+                return out_carry, None
+            return do_step(carry, step_idx)
+
+        init_early_stopped = jnp.array(False)
+        (cur_seqs, _, _), _ = jax.lax.scan(
+            step, (cur_seqs, rng, init_early_stopped), jnp.arange(num_steps)
+        )
         return bins_to_continuous(cur_seqs, self.num_bins)
 
     def apply_mask(self, rng: jax.Array, input_tokens: jax.Array) -> jax.Array:
@@ -353,7 +381,14 @@ class DiscreteDiffusionPolicy(nnx.Module):
         rng, time_rng, vals_rng, unmask_rng, d_rng = jax.random.split(rng, 5)
         # 1) Which positions can be masked (ref: loss_mask_full). When inpainting_mask=True, never mask the first d actions (d in 0..chunk_size//2; d=0 => all maskable).
         if self.inpainting_mask:
-            d = jax.random.randint(d_rng, (), 0, self.action_chunk_size // 2 + 1)
+            max_d = self.action_chunk_size // 2
+            d_choices = jnp.arange(max_d + 1)
+            if self.inpainting_d_schedule == "linear_decay":
+                # Favor small d: P(d=k) ∝ (max_d + 1 - k), so d=0 is most likely
+                weights = (max_d + 1 - d_choices).astype(jnp.float32)
+            else:
+                weights = jnp.ones(max_d + 1, dtype=jnp.float32)
+            d = jax.random.choice(d_rng, d_choices, shape=(), p=weights / jnp.sum(weights))
             # Use comparison instead of slice so d can be dynamic under JIT
             loss_mask_full = (jnp.arange(self.action_chunk_size) >= d)[None, :, None]
         else:
@@ -418,5 +453,17 @@ class DiscreteDiffusionPolicy(nnx.Module):
         # Average over masked positions per sample, then mean over batch (not sum).
         num_masked_per_sample = jnp.sum(loss_mask, axis=(1, 2)) + 1e-8
         ce_sum_per_sample = jnp.sum(ce_masked, axis=(1, 2))
-        loss_per_sample = ce_sum_per_sample / num_masked_per_sample
-        return jnp.mean(loss_per_sample)
+        ce_loss = jnp.mean(ce_sum_per_sample / num_masked_per_sample)
+
+        # L1 in continuous action space: pred_continuous = E[bin_center] under softmax(logits)
+        bin_centers = (jnp.arange(self.num_bins, dtype=jnp.float32) + 0.5) / self.num_bins * 2.0 - 1.0
+        probs = jax.nn.softmax(logits, axis=-1)
+        pred_continuous = jnp.sum(probs * bin_centers, axis=-1)
+        l1_per_pos = jnp.abs(pred_continuous - action)
+
+        loss_total = ce_loss
+        if self.l1_loss_weight > 0:
+            l1_masked = jnp.where(loss_mask, l1_per_pos, 0.0)
+            l1_masked_per_sample = jnp.sum(l1_masked, axis=(1, 2)) / num_masked_per_sample
+            loss_total = loss_total + self.l1_loss_weight * jnp.mean(l1_masked_per_sample)
+        return loss_total
