@@ -54,7 +54,7 @@ class Config:
 
     # Eval during training: same structure as eval_flow.EvalConfig but with model_dd.ModelConfig
     eval_num_evals: int = 128
-    eval_num_flow_steps: int = 8  # More decode steps → better action quality (align with eval_dd)
+    eval_num_flow_steps: int = 5  # More decode steps → better action quality (align with eval_dd)
     eval_inference_delay: int = 0
     eval_execute_horizon: int = 1
     eval_model: _model_dd.ModelConfig = dataclasses.field(default_factory=_model_dd.ModelConfig)
@@ -223,10 +223,11 @@ def main(config: Config):
                     0.0,
                     action_chunks,
                 )
-                return policy.loss(key, obs, action_chunks)
+                loss_total, loss_info = policy.loss(key, obs, action_chunks)
+                return loss_total, loss_info
 
-            loss, grads = nnx.value_and_grad(loss_fn)(policy)
-            info = {"loss": loss, "grad_norm": optax.global_norm(grads)}
+            (loss, loss_info), grads = nnx.value_and_grad(loss_fn, has_aux=True)(policy)
+            info = {"loss": loss, "loss_ce": loss_info["ce_loss"], "loss_l1": loss_info["l1_loss"], "grad_norm": optax.global_norm(grads)}
             optimizer.update(grads)
             _, train_state = nnx.split((policy, optimizer))
             return (rng, train_state), info
@@ -241,6 +242,8 @@ def main(config: Config):
         # Eval: same interface as FlowPolicy (action, realtime_action, bid_action)
         rng, key = jax.random.split(rng)
         eval_policy, _ = nnx.merge(epoch_carry.graphdef, train_state)
+        # Eval at each execute_horizon (1=replan every step, 8=full chunk). For comparison with
+        # eval_dd.py (naive, delay=0), use returned_episode_solved_1; _8 is easier and often higher.
         eval_info = {}
         for horizon in range(1, action_chunk_size + 1):
             eval_config = _make_eval_config(config, horizon)

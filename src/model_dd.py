@@ -66,6 +66,18 @@ def _mask_by_random_topk(
     return action_mask
 
 
+def _mask_by_deterministic_lowest(
+    selected_probs: jax.Array,
+    mask_len: jax.Array,
+) -> jax.Array:
+    """Which positions stay masked: deterministic = mask the mask_len lowest-confidence positions.
+    selected_probs [B, L]; mask_len [B]. Returns action_mask [B, L] with True = stay masked.
+    """
+    perm = jnp.argsort(selected_probs, axis=1)  # ascending: smallest prob first
+    ranks = jnp.argsort(perm, axis=1)
+    return ranks < mask_len[:, None]
+
+
 def continuous_to_bins(actions: jax.Array, num_bins: int) -> jax.Array:
     """Map continuous actions in [-1, 1] to bin indices in [0, num_bins-1]."""
     # Clamp to (-1, 1) then map: [-1, 1] -> [0, num_bins-1]
@@ -92,10 +104,9 @@ class ModelConfig:
     inpainting_d_schedule: Literal["uniform", "linear_decay"] = "linear_decay"  # "linear_decay" favors small d (more full-sequence practice)
     # Training-time masking (ref.py): schedule for mask ratio, no_mask_token_prob
     train_mask_schedule: Literal["cosine", "linear"] = "cosine"
-    no_mask_token_prob: float = 0.05
-    # Decode (realtime_decode-style): schedule and temperature
+    no_mask_token_prob: float = 0.0
+    # Decode (realtime_decode-style): schedule (temperature is eval-time only, see EvalConfig.choice_temperature)
     decode_schedule: Literal["cosine", "linear"] = "cosine"
-    choice_temperature: float = 1.0
     use_remask: bool = False  # Re-mask low-confidence positions during decode; improves quality
     # Weak supervision in continuous action space: L1 on masked positions (nearly correct)
     l1_loss_weight: float = 0.1  # L1 on masked positions; set >0 (e.g. 0.1) to enable
@@ -121,7 +132,6 @@ class DiscreteDiffusionPolicy(nnx.Module):
         self.train_mask_schedule = config.train_mask_schedule
         self.no_mask_token_prob = config.no_mask_token_prob
         self.decode_schedule = config.decode_schedule
-        self.choice_temperature = config.choice_temperature
         self.use_remask = config.use_remask
         self.l1_loss_weight = config.l1_loss_weight
         # Mask token index: positions with this value (or IGNORE_TOKEN in input) are "to be predicted".
@@ -190,8 +200,19 @@ class DiscreteDiffusionPolicy(nnx.Module):
         )
         return logits
 
-    def action(self, rng: jax.Array, obs: jax.Array, num_steps: int) -> jax.Array:
-        """MaskGIT-style decode from all-masked input (ref realtime_decode). Gradual unmasking via schedule + mask_by_random_topk."""
+    def action(
+        self,
+        rng: jax.Array,
+        obs: jax.Array,
+        num_steps: int,
+        choice_temperature: float = 0.1,
+        decode_temperature: float = 1.0,
+    ) -> jax.Array:
+        """MaskGIT-style decode from all-masked input (ref realtime_decode). Gradual unmasking via schedule + top-k.
+        temp=0 → deterministic (argmax / lowest-conf unmasking); temp>0 → sampling with that temperature.
+        """
+        deterministic = decode_temperature == 0
+        deterministic_choice = choice_temperature == 0
         B = obs.shape[0]
         L = self.action_chunk_size * self.action_dim
         cur_seqs = jnp.full(
@@ -204,21 +225,29 @@ class DiscreteDiffusionPolicy(nnx.Module):
         def step(carry, step_idx):
             cur_seqs, rng_state = carry
             rng_state, cat_key, topk_key = jax.random.split(rng_state, 3)
-            # 1) Logits and probs
+            # 1) Logits and token prediction
             logits = self(obs, cur_seqs)
-            probs = jax.nn.softmax(logits, axis=-1)
-            # 2) Categorical sample over all positions
-            sampled = jax.random.categorical(cat_key, logits, axis=-1)
+            if deterministic:
+                sampled = jnp.argmax(logits, axis=-1)
+                # Confidence for mask selection: max logit (high = confident); no temperature scaling needed
+                selected_probs = jnp.max(logits, axis=-1)
+            else:
+                safe_temp = jnp.clip(decode_temperature, 1e-8, 1e10)
+                logits_scaled = jnp.where(
+                    jnp.isfinite(decode_temperature), logits / safe_temp, jnp.zeros_like(logits)
+                )
+                probs = jax.nn.softmax(logits_scaled, axis=-1)
+                sampled = jax.random.categorical(cat_key, logits_scaled, axis=-1)
+                selected_probs = jnp.take_along_axis(probs, sampled[..., None], axis=-1).squeeze(-1)
             unknown_map = cur_seqs == self.mask_token_id
             sampled = jnp.where(unknown_map, sampled, cur_seqs)
-            # 3) Ratio and mask_len for this step (at most unknown_init-1 so at least one unmasked)
+            # 2) Ratio and mask_len for this step (at most unknown_init-1 so at least one unmasked)
             ratio = (step_idx + 1.0) / num_steps
             mask_ratio = _decode_mask_schedule(ratio, self.decode_schedule)
             mask_len = (unknown_init.astype(jnp.float32) * mask_ratio).astype(jnp.int32)
             mask_len = jnp.clip(mask_len, 1, jnp.maximum(unknown_init - 1, 0))
             mask_len = jnp.where(step_idx == num_steps - 1, 0, mask_len)
-            # 4) Selected probs (confidence at sampled token)
-            selected_probs = jnp.take_along_axis(probs, sampled[..., None], axis=-1).squeeze(-1)
+            # 4) Adjust selected_probs for remask if needed
             if self.use_remask:
                 p_remask = 1.0 - ratio
                 selected_probs = jnp.where(
@@ -228,18 +257,19 @@ class DiscreteDiffusionPolicy(nnx.Module):
                 )
             else:
                 selected_probs = jnp.where(unknown_map, selected_probs, jnp.float32("inf"))
-            # 5) Which positions stay masked (Gumbel + top-k)
-            temp = self.choice_temperature * (1.0 - ratio)
+            # 5) Which positions stay masked: deterministic_choice = lowest-conf vs Gumbel top-k
             selected_flat = selected_probs.reshape(B, L)
-            action_mask_flat = _mask_by_random_topk(topk_key, selected_flat, mask_len, temp)
+            if deterministic_choice:
+                action_mask_flat = _mask_by_deterministic_lowest(selected_flat, mask_len)
+            else:
+                temp = choice_temperature * (1.0 - ratio)
+                action_mask_flat = _mask_by_random_topk(topk_key, selected_flat, mask_len, temp)
             action_mask = action_mask_flat.reshape(B, self.action_chunk_size, self.action_dim)
             # 6) Next seqs: masked positions keep mask_token_id, rest get sampled
             next_seqs = jnp.where(action_mask, self.mask_token_id, sampled)
             return (next_seqs, rng_state), None
 
         (cur_seqs, _), _ = jax.lax.scan(step, (cur_seqs, rng), jnp.arange(num_steps))
-        # Final cur_seqs may still have some mask positions on non-last step; use sampled from last step.
-        # Actually after last step we set mask_len=0 so action_mask is all False, next_seqs = sampled. So cur_seqs is full.
         return bins_to_continuous(cur_seqs, self.num_bins)
 
     def bid_action(
@@ -253,6 +283,8 @@ class DiscreteDiffusionPolicy(nnx.Module):
         n_samples: int,
         bid_weak_policy: Self | None = None,
         bid_k: int | None = None,
+        choice_temperature: float = 0.1,
+        decode_temperature: float = 1.0,
     ) -> jax.Array:
         obs = einops.repeat(obs, "b ... -> (n b) ...", n=n_samples)
         weights = get_prefix_weights(inference_delay, prefix_attention_horizon, self.action_chunk_size, "exp")
@@ -261,13 +293,31 @@ class DiscreteDiffusionPolicy(nnx.Module):
             error = jnp.linalg.norm(action_chunks - prev_action_chunk, axis=-1)
             return jnp.sum(error * weights[None, None, :], axis=-1)
 
-        strong_actions = einops.rearrange(self.action(rng, obs, num_steps), "(n b) h d -> n b h d", n=n_samples)
+        strong_actions = einops.rearrange(
+            self.action(
+                rng,
+                obs,
+                num_steps,
+                choice_temperature=choice_temperature,
+                decode_temperature=decode_temperature,
+            ),
+            "(n b) h d -> n b h d",
+            n=n_samples,
+        )
         loss = backward_loss(strong_actions)
 
         if bid_weak_policy is not None or bid_k is not None:
             assert bid_weak_policy is not None and bid_k is not None, (bid_weak_policy, bid_k)
             weak_actions = einops.rearrange(
-                bid_weak_policy.action(rng, obs, num_steps), "(n b) h d -> n b h d", n=n_samples
+                bid_weak_policy.action(
+                    rng,
+                    obs,
+                    num_steps,
+                    choice_temperature=choice_temperature,
+                    decode_temperature=decode_temperature,
+                ),
+                "(n b) h d -> n b h d",
+                n=n_samples,
             )
             weak_loss = backward_loss(weak_actions)
             weak_idxs = jax.lax.top_k(-weak_loss.T, bid_k)[1].T
@@ -295,10 +345,14 @@ class DiscreteDiffusionPolicy(nnx.Module):
         inference_delay: int,
         execute_horizon: int | None = None,
         early_stop: bool = False,
+        choice_temperature: float = 0.1,
+        decode_temperature: float = 1.0,
     ) -> jax.Array:
         """MaskGIT-style decode with fixed prefix (ref realtime_decode). Prefix = first inference_delay steps; rest gradual unmask.
-        If early_stop=True and execute_horizon is set: return once the first d+s actions (d=inference_delay, s=execute_horizon) are all unmasked.
+        temp=0 → deterministic (argmax / lowest-conf unmasking); temp>0 → sampling.
         """
+        deterministic = decode_temperature == 0
+        deterministic_choice = choice_temperature == 0
         B = obs.shape[0]
         L = self.action_chunk_size * self.action_dim
         prefix_bins = continuous_to_bins(prev_action_chunk, self.num_bins)
@@ -318,8 +372,17 @@ class DiscreteDiffusionPolicy(nnx.Module):
             cur_seqs, rng_state, early_stopped = carry
             rng_state, cat_key, topk_key = jax.random.split(rng_state, 3)
             logits = self(obs, cur_seqs)
-            probs = jax.nn.softmax(logits, axis=-1)
-            sampled = jax.random.categorical(cat_key, logits, axis=-1)
+            if deterministic:
+                sampled = jnp.argmax(logits, axis=-1)
+                selected_probs = jnp.max(logits, axis=-1)
+            else:
+                safe_temp = jnp.clip(decode_temperature, 1e-8, 1e10)
+                logits_scaled = jnp.where(
+                    jnp.isfinite(decode_temperature), logits / safe_temp, jnp.zeros_like(logits)
+                )
+                probs = jax.nn.softmax(logits_scaled, axis=-1)
+                sampled = jax.random.categorical(cat_key, logits_scaled, axis=-1)
+                selected_probs = jnp.take_along_axis(probs, sampled[..., None], axis=-1).squeeze(-1)
             unknown_map = cur_seqs == self.mask_token_id
             sampled = jnp.where(prefix_mask, prefix_bins, jnp.where(unknown_map, sampled, cur_seqs))
             ratio = (step_idx + 1.0) / num_steps
@@ -327,7 +390,6 @@ class DiscreteDiffusionPolicy(nnx.Module):
             mask_len = (unknown_init.astype(jnp.float32) * mask_ratio).astype(jnp.int32)
             mask_len = jnp.clip(mask_len, 1, jnp.maximum(unknown_init - 1, 0))
             mask_len = jnp.where(step_idx == num_steps - 1, 0, mask_len)
-            selected_probs = jnp.take_along_axis(probs, sampled[..., None], axis=-1).squeeze(-1)
             if self.use_remask:
                 p_remask = 1.0 - ratio
                 selected_probs = jnp.where(
@@ -337,9 +399,12 @@ class DiscreteDiffusionPolicy(nnx.Module):
                 )
             else:
                 selected_probs = jnp.where(unknown_map, selected_probs, jnp.float32("inf"))
-            temp = self.choice_temperature * (1.0 - ratio)
             selected_flat = selected_probs.reshape(B, L)
-            action_mask_flat = _mask_by_random_topk(topk_key, selected_flat, mask_len, temp)
+            if deterministic_choice:
+                action_mask_flat = _mask_by_deterministic_lowest(selected_flat, mask_len)
+            else:
+                temp = choice_temperature * (1.0 - ratio)
+                action_mask_flat = _mask_by_random_topk(topk_key, selected_flat, mask_len, temp)
             action_mask = action_mask_flat.reshape(B, self.action_chunk_size, self.action_dim)
             next_seqs = jnp.where(
                 prefix_mask, prefix_bins, jnp.where(action_mask, self.mask_token_id, sampled)
@@ -427,12 +492,16 @@ class DiscreteDiffusionPolicy(nnx.Module):
         obs: jax.Array,
         action: jax.Array,
         input_tokens: jax.Array | None = None,
-    ) -> jax.Array:
+    ) -> tuple[jax.Array, dict]:
         """Cross-entropy on masked positions only. Input-token masking is done in this method.
 
         By default (input_tokens is None), masking is applied via self.apply_mask(rng, target_bins)
         (ref-style: schedule, top-k, no_mask_token_prob, RTC first-d).
         If input_tokens is provided, it is used as-is (caller controls masking).
+
+        Returns:
+            loss_total: scalar loss for backward.
+            info: dict with "ce_loss" and "l1_loss" for logging.
         """
         assert action.dtype == jnp.float32
         assert action.shape == (obs.shape[0], self.action_chunk_size, self.action_dim), action.shape
@@ -455,15 +524,14 @@ class DiscreteDiffusionPolicy(nnx.Module):
         ce_sum_per_sample = jnp.sum(ce_masked, axis=(1, 2))
         ce_loss = jnp.mean(ce_sum_per_sample / num_masked_per_sample)
 
-        # L1 in continuous action space: pred_continuous = E[bin_center] under softmax(logits)
+        # L1 in continuous action space on all tokens: pred_continuous = E[bin_center] under softmax(logits)
         bin_centers = (jnp.arange(self.num_bins, dtype=jnp.float32) + 0.5) / self.num_bins * 2.0 - 1.0
         probs = jax.nn.softmax(logits, axis=-1)
         pred_continuous = jnp.sum(probs * bin_centers, axis=-1)
         l1_per_pos = jnp.abs(pred_continuous - action)
+        l1_loss = jnp.mean(l1_per_pos)
 
         loss_total = ce_loss
         if self.l1_loss_weight > 0:
-            l1_masked = jnp.where(loss_mask, l1_per_pos, 0.0)
-            l1_masked_per_sample = jnp.sum(l1_masked, axis=(1, 2)) / num_masked_per_sample
-            loss_total = loss_total + self.l1_loss_weight * jnp.mean(l1_masked_per_sample)
-        return loss_total
+            loss_total = loss_total + self.l1_loss_weight * l1_loss
+        return loss_total, {"ce_loss": ce_loss, "l1_loss": l1_loss}

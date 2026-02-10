@@ -14,6 +14,7 @@ import pickle
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Sequence
 
 import flax.nnx as nnx
@@ -55,13 +56,20 @@ class BIDMethodConfig:
 class EvalConfig:
     step: int = -1
     weak_step: int | None = None
-    # num_evals: int = 2048
-    num_evals: int = 256
-    num_flow_steps: int = 10
+    num_evals: int = 2048
+    # num_evals: int = 256
+    num_flow_steps: int = 5
 
     inference_delay: int = 0
     execute_horizon: int = 1
     method: NaiveMethodConfig | RealtimeMethodConfig | DiscreteRTCConfig | BIDMethodConfig = NaiveMethodConfig()
+
+    # Eval-time decode temperature (not a model parameter); used when sampling which positions to unmask (if deterministic_choice=False).
+    # 0.1 gives a good balance; temp=0 implicitly sets deterministic_choice=True.
+    choice_temperature: float = 0.0
+    # Temperature for token probs during decode: probs = softmax(logits / decode_temperature). inf → uniform, 0 → argmax; 1.0 = standard.
+    # temp=0 implicitly sets deterministic_decode=True.
+    decode_temperature: float = 1.0
 
     model: _model_dd.ModelConfig = _model_dd.ModelConfig()
 
@@ -95,9 +103,74 @@ def _eval_config_to_dict(
     d["sweep"] = {
         "inference_delays": [0, 1, 2, 3, 4],
         "execute_horizon": "max(1, inference_delay)",
-        "methods": ["naive", "realtime", "discrete_rtc", "bid"],
+        "methods": ["naive", "discrete_rtc", "bid"],
     }
     return d
+
+
+def _benchmark_inference_s(
+    policy: _model_dd.DiscreteDiffusionPolicy,
+    config: EvalConfig,
+    obs_dim: int,
+    action_dim: int,
+    n_warmup: int = 3,
+    n_timed: int = 20,
+) -> float:
+    """Mean wall time (seconds) per action-chunk inference for the current config's method."""
+    rng = jax.random.key(0)
+    obs = jnp.zeros((config.num_evals, obs_dim))
+    action_chunk = jnp.zeros((config.num_evals, policy.action_chunk_size, action_dim))
+    prefix_h = policy.action_chunk_size - config.execute_horizon
+    ct, dt = config.choice_temperature, config.decode_temperature
+
+    def run_naive():
+        k, _ = jax.random.split(rng)
+        return policy.action(k, obs, config.num_flow_steps, choice_temperature=ct, decode_temperature=dt)
+
+    def run_realtime():
+        k, _ = jax.random.split(rng)
+        return policy.realtime_action(
+            k,
+            obs,
+            config.num_flow_steps,
+            action_chunk,
+            config.inference_delay,
+            config.execute_horizon,
+            False,
+            choice_temperature=ct,
+            decode_temperature=dt,
+        )
+
+    def run_bid():
+        k, _ = jax.random.split(rng)
+        return policy.bid_action(
+            k,
+            obs,
+            config.num_flow_steps,
+            action_chunk,
+            config.inference_delay,
+            prefix_h,
+            config.method.n_samples,
+            bid_weak_policy=None,
+            bid_k=None,
+            choice_temperature=ct,
+            decode_temperature=dt,
+        )
+
+    if isinstance(config.method, NaiveMethodConfig):
+        fn = run_naive
+    elif isinstance(config.method, (RealtimeMethodConfig, DiscreteRTCConfig)):
+        fn = run_realtime
+    elif isinstance(config.method, BIDMethodConfig):
+        fn = run_bid
+    else:
+        raise ValueError(type(config.method))
+    for _ in range(n_warmup):
+        jax.block_until_ready(fn())
+    start = time.perf_counter()
+    for _ in range(n_timed):
+        jax.block_until_ready(fn())
+    return (time.perf_counter() - start) / n_timed
 
 
 def eval(
@@ -125,8 +198,11 @@ def eval(
 
         rng, obs, env_state, action_chunk, n = carry
         rng, key = jax.random.split(rng)
+        ct, dt = config.choice_temperature, config.decode_temperature
         if isinstance(config.method, NaiveMethodConfig):
-            next_action_chunk = policy.action(key, obs, config.num_flow_steps)
+            next_action_chunk = policy.action(
+                key, obs, config.num_flow_steps, choice_temperature=ct, decode_temperature=dt
+            )
         elif isinstance(config.method, (RealtimeMethodConfig, DiscreteRTCConfig)):
             prefix_attention_horizon = policy.action_chunk_size - config.execute_horizon
             assert (
@@ -141,6 +217,8 @@ def eval(
                 config.inference_delay,
                 config.execute_horizon,
                 config.method.early_stop,
+                choice_temperature=ct,
+                decode_temperature=dt,
             )
         elif isinstance(config.method, BIDMethodConfig):
             prefix_attention_horizon = policy.action_chunk_size - config.execute_horizon
@@ -156,6 +234,8 @@ def eval(
                 config.method.n_samples,
                 bid_k=config.method.bid_k,
                 bid_weak_policy=weak_policy if config.method.bid_k is not None else None,
+                choice_temperature=ct,
+                decode_temperature=dt,
             )
         else:
             raise ValueError(f"Unknown method: {config.method}")
@@ -183,7 +263,13 @@ def eval(
     rng, key = jax.random.split(rng)
     obs, env_state = env.reset_to_level(key, level, env_params)
     rng, key = jax.random.split(rng)
-    action_chunk = policy.action(key, obs, config.num_flow_steps)
+    action_chunk = policy.action(
+        key,
+        obs,
+        config.num_flow_steps,
+        choice_temperature=config.choice_temperature,
+        decode_temperature=config.decode_temperature,
+    )
     n = jnp.ones(action_chunk.shape[1], dtype=jnp.int32)
     scan_length = math.ceil(env_params.max_timesteps / config.execute_horizon)
     _, (dones, env_states, infos) = jax.lax.scan(
@@ -201,8 +287,17 @@ def eval(
     for key in ["match"]:
         if key in infos:
             return_info[key] = jnp.mean(infos[key])
+    # Average task completion time (seconds): mean episode length * step duration
+    step_duration_s = float(env_params.dt) * int(static_env_params.frame_skip)
+    return_info["mean_task_completion_time_s"] = return_info["returned_episode_lengths"] * step_duration_s
     video = render_video(jax.tree.map(lambda x: x[:, 0], env_states))
     return return_info, video
+
+
+def _append_row_to_csv(path: pathlib.Path, row: dict, write_header: bool) -> None:
+    """Append a single row to CSV on the fly. write_header=True for first row."""
+    mode = "w" if write_header else "a"
+    pd.DataFrame([row]).to_csv(path, mode=mode, header=write_header, index=False)
 
 
 def run_eval_chunk(
@@ -210,6 +305,7 @@ def run_eval_chunk(
     config: EvalConfig,
     level_paths: Sequence[str],
     seed: int,
+    results_path: pathlib.Path | None = None,
 ) -> list[dict]:
     """Run full eval sweep for a subset of levels; returns list of row dicts (one per level × delay × method × horizon)."""
     static_env_params = kenv_state.StaticEnvParams(**train_expert.LARGE_ENV_PARAMS, frame_skip=train_expert.FRAME_SKIP)
@@ -238,6 +334,17 @@ def run_eval_chunk(
     ].shape[-1]
     action_dim = env.action_space(env_params).shape[0]
     action_chunk_size = config.model.action_chunk_size
+
+    # One policy for inference timing (same weights as first level)
+    benchmark_policy = _model_dd.DiscreteDiffusionPolicy(
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        config=config.model,
+        rngs=nnx.Rngs(jax.random.key(seed + 999)),
+    )
+    b_graphdef, b_state = nnx.split(benchmark_policy)
+    b_state.replace_by_pure_dict(state_dicts[0])
+    benchmark_policy = nnx.merge(b_graphdef, b_state)
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def _eval_single(
@@ -277,43 +384,48 @@ def run_eval_chunk(
         return out_list
 
     rows: list[dict] = []
-    for inference_delay in [0, 1, 2, 3, 4]:
-        execute_horizon_min = max(1, inference_delay)
-        # execute_horizon_max = action_chunk_size - inference_delay
-        execute_horizon_max = execute_horizon_min
+    # for inference_delay in [0, 1, 2, 3, 4]:
+    for inference_delay in [3, 4]:
+        # execute_horizon_min = max(1, inference_delay)
+        execute_horizon_min = action_chunk_size - inference_delay
+        execute_horizon_max = action_chunk_size - inference_delay
+        # execute_horizon_max = execute_horizon_min
         for execute_horizon in range(execute_horizon_min, execute_horizon_max + 1):
             print(f"{inference_delay=} {execute_horizon=}")
             c = dataclasses.replace(
                 config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=NaiveMethodConfig()
             )
+            mean_inference_s = _benchmark_inference_s(benchmark_policy, c, obs_dim, action_dim)
             out_list = run_config(c)
             for i in range(len(level_paths)):
-                row = {"delay": inference_delay, "method": "naive", "level": level_paths[i], "execute_horizon": execute_horizon, **out_list[i]}
+                row = {"delay": inference_delay, "method": "naive", "level": level_paths[i], "execute_horizon": execute_horizon, "mean_inference_s": mean_inference_s, **out_list[i]}
                 rows.append(row)
-
-            c = dataclasses.replace(
-                config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=RealtimeMethodConfig()
-            )
-            out_list = run_config(c)
-            for i in range(len(level_paths)):
-                row = {"delay": inference_delay, "method": "realtime", "level": level_paths[i], "execute_horizon": execute_horizon, **out_list[i]}
-                rows.append(row)
+                if results_path is not None:
+                    _append_row_to_csv(results_path, row, write_header=(len(rows) == 1))
 
             c = dataclasses.replace(
                 config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=DiscreteRTCConfig()
             )
+            mean_inference_s = _benchmark_inference_s(benchmark_policy, c, obs_dim, action_dim)
             out_list = run_config(c)
             for i in range(len(level_paths)):
-                row = {"delay": inference_delay, "method": "discrete_rtc", "level": level_paths[i], "execute_horizon": execute_horizon, **out_list[i]}
+                row = {"delay": inference_delay, "method": "discrete_rtc", "level": level_paths[i], "execute_horizon": execute_horizon, "mean_inference_s": mean_inference_s, **out_list[i]}
                 rows.append(row)
+                if results_path is not None:
+                    _append_row_to_csv(results_path, row, write_header=(len(rows) == 1))
 
             c = dataclasses.replace(
                 config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=BIDMethodConfig()
             )
+            mean_inference_s = _benchmark_inference_s(benchmark_policy, c, obs_dim, action_dim)
             out_list = run_config(c)
             for i in range(len(level_paths)):
-                row = {"delay": inference_delay, "method": "bid", "level": level_paths[i], "execute_horizon": execute_horizon, **out_list[i]}
+                row = {"delay": inference_delay, "method": "bid", "level": level_paths[i], "execute_horizon": execute_horizon, "mean_inference_s": mean_inference_s, **out_list[i]}
                 rows.append(row)
+                if results_path is not None:
+                    _append_row_to_csv(results_path, row, write_header=(len(rows) == 1))
+            # Clear JAX compilation cache to avoid OOM from unbounded growth across (delay, horizon) configs
+            jax.clear_caches()
     return rows
 
 
@@ -340,8 +452,17 @@ def main(
 ):
     """Run evaluation. Use num_gpus > 1 to distribute levels across GPUs via separate processes (avoids NCCL)."""
     level_paths = list(level_paths)
+    output_path = pathlib.Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    config_dict = _eval_config_to_dict(
+        config, run_path=run_path, level_paths=level_paths, seed=seed, output_dir=output_dir
+    )
+    with (output_path / "eval_config.json").open("w") as f:
+        json.dump(config_dict, f, indent=2)
+
     if num_gpus <= 1:
-        rows = run_eval_chunk(run_path, config, level_paths, seed)
+        results_path = output_path / "results.csv"
+        rows = run_eval_chunk(run_path, config, level_paths, seed, results_path=results_path)
     else:
         num_gpus = min(num_gpus, len(level_paths))
         print(f"Using {num_gpus} GPUs (one process per GPU)")
@@ -357,8 +478,9 @@ def main(
             for i, chunk in enumerate(chunks):
                 in_path = pathlib.Path(tmpdir) / f"in_{i}.pkl"
                 out_paths.append(pathlib.Path(tmpdir) / f"out_{i}.pkl")
+                worker_results_path = output_path / f"results_worker{i}.csv"
                 with in_path.open("wb") as f:
-                    pickle.dump((run_path, config, chunk, seed + i), f)
+                    pickle.dump((run_path, config, chunk, seed + i, str(worker_results_path)), f)
                 env = {**os.environ, "EVAL_DD_GPU_ID": str(i)}
                 procs.append(
                     subprocess.Popen(
@@ -375,23 +497,18 @@ def main(
                 with out_path.open("rb") as f:
                     all_rows.extend(pickle.load(f))
         rows = all_rows
-
-    pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
-    config_dict = _eval_config_to_dict(
-        config, run_path=run_path, level_paths=level_paths, seed=seed, output_dir=output_dir
-    )
-    with (pathlib.Path(output_dir) / "eval_config.json").open("w") as f:
-        json.dump(config_dict, f, indent=2)
-    df = pd.DataFrame(rows)
-    df.to_csv(pathlib.Path(output_dir) / "results.csv", index=False)
+        # Merge worker CSVs into results.csv (worker CSVs written on the fly; partial results preserved if main crashes)
+        df = pd.DataFrame(rows)
+        df.to_csv(output_path / "results.csv", index=False)
 
 
 if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "worker":
         in_path, out_path = sys.argv[2], sys.argv[3]
         with open(in_path, "rb") as f:
-            run_path, config, level_paths, seed = pickle.load(f)
-        rows = run_eval_chunk(run_path, config, level_paths, seed)
+            run_path, config, level_paths, seed, results_path_str = pickle.load(f)
+        results_path = pathlib.Path(results_path_str) if results_path_str else None
+        rows = run_eval_chunk(run_path, config, level_paths, seed, results_path=results_path)
         with open(out_path, "wb") as f:
             pickle.dump(rows, f)
     else:

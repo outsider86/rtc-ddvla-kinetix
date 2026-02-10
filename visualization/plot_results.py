@@ -4,6 +4,7 @@ import pathlib
 from typing import Literal
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import seaborn as sns
 
@@ -29,8 +30,14 @@ def plot_solve_rate_by_delay_horizon(
 ) -> None:
     """Heatmap: average metric vs (inference_delay, execute_horizon) for a method."""
     subset = df[df["method"] == method].copy()
+    if subset.empty:
+        return
     agg = subset.groupby(["delay", "execute_horizon"])[metric].mean().reset_index()
+    if agg.empty:
+        return
     pivot = agg.pivot(index="delay", columns="execute_horizon", values=metric)
+    if pivot.size == 0:
+        return
 
     fig, ax = plt.subplots(figsize=(8, 5))
     sns.heatmap(pivot, annot=True, fmt=".2f", cmap="RdYlGn", vmin=0, vmax=1, ax=ax)
@@ -97,7 +104,9 @@ def plot_delay_effect(
     ax.set_xlabel("inference_delay")
     ax.set_ylabel(metric)
     ax.set_title(f"{metric} vs inference_delay ({method})")
-    ax.legend()
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        ax.legend()
     ax.set_xticks(sorted(agg["delay"].unique()))
     ax.set_ylim(0, 1.05)
     plt.tight_layout()
@@ -193,9 +202,15 @@ def plot_per_level_heatmap(
 ) -> None:
     """Heatmap: level vs (delay, execute_horizon) for a method."""
     subset = df[df["method"] == method].copy()
+    if subset.empty:
+        return
     subset["d/h"] = subset["delay"].astype(str) + "/" + subset["execute_horizon"].astype(str)
     agg = subset.groupby(["level_short", "d/h"])[metric].mean().reset_index()
+    if agg.empty:
+        return
     pivot = agg.pivot(index="level_short", columns="d/h", values=metric)
+    if pivot.size == 0:
+        return
 
     fig, ax = plt.subplots(figsize=(14, 6))
     sns.heatmap(pivot, annot=True, fmt=".2f", cmap="RdYlGn", vmin=0, vmax=1, ax=ax)
@@ -210,12 +225,86 @@ def plot_per_level_heatmap(
     plt.close()
 
 
+def plot_mean_inference_time(
+    df: pd.DataFrame,
+    output_path: str | pathlib.Path | None = None,
+    show: bool = True,
+) -> None:
+    """Bar chart: mean inference time (s) per method; and line plot: inference time vs delay per method."""
+    if "mean_inference_s" not in df.columns:
+        return
+    # One value per (delay, method, execute_horizon); take first per (delay, method)
+    agg = df.groupby(["delay", "method"])["mean_inference_s"].first().reset_index()
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Left: mean inference time by method (average over delay)
+    method_agg = agg.groupby("method")["mean_inference_s"].mean().reset_index()
+    sns.barplot(data=method_agg, x="method", y="mean_inference_s", hue="method", legend=False, ax=axes[0])
+    axes[0].set_ylabel("Mean inference time (s)")
+    axes[0].set_title("Mean action inference time by method")
+    axes[0].tick_params(axis="x", rotation=15)
+
+    # Right: inference time vs delay, one line per method
+    for method in agg["method"].unique():
+        sub = agg[agg["method"] == method].sort_values("delay")
+        axes[1].plot(sub["delay"], sub["mean_inference_s"], marker="o", label=method)
+    axes[1].set_xlabel("inference_delay")
+    axes[1].set_ylabel("Mean inference time (s)")
+    axes[1].set_title("Inference time vs inference_delay")
+    axes[1].legend()
+    axes[1].set_xticks(sorted(agg["delay"].unique()))
+
+    plt.tight_layout()
+    if output_path:
+        plt.savefig(output_path, dpi=150)
+    if show:
+        plt.show()
+    plt.close()
+
+
+def plot_total_eval_wall_time(
+    df: pd.DataFrame,
+    output_path: str | pathlib.Path | None = None,
+    show: bool = True,
+) -> None:
+    """Grouped bar: total eval wall time (s) per (delay, method)."""
+    if "total_eval_wall_s" not in df.columns:
+        return
+    agg = df.groupby(["delay", "method"])["total_eval_wall_s"].first().reset_index()
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    sns.barplot(
+        data=agg,
+        x="delay",
+        y="total_eval_wall_s",
+        hue="method",
+        ax=ax,
+    )
+    ax.set_xlabel("inference_delay")
+    ax.set_ylabel("Total eval wall time (s)")
+    ax.set_title("Total evaluation time per setting (all levels)")
+    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left")
+    plt.tight_layout()
+    if output_path:
+        plt.savefig(output_path, dpi=150)
+    if show:
+        plt.show()
+    plt.close()
+
+
 def plot_all(
     csv_path: str | pathlib.Path = "eval_logs/results.csv",
     output_dir: str | pathlib.Path | None = None,
     show: bool = True,
+    method: str = "realtime",
 ) -> None:
-    """Generate all standard visualizations and optionally save to output_dir."""
+    """Generate all standard visualizations and optionally save to output_dir.
+
+    The `method` argument controls which method is used for the single‑method plots
+    (heatmaps and delay curves). For datasets without a `realtime` method (e.g.
+    discrete RTC only), pass `method=\"discrete_rtc\"` instead.
+    """
     df = load_results(csv_path)
     out = pathlib.Path(output_dir) if output_dir else None
     if out:
@@ -225,13 +314,17 @@ def plot_all(
         return out / f"{name}.png" if out else None
 
     plot_solve_rate_by_delay_horizon(
-        df, "realtime", output_path=_save("solve_rate_heatmap_realtime"), show=show
+        df, method, output_path=_save(f"solve_rate_heatmap_{method}"), show=show
     )
     plot_method_comparison(df, aggregate="all", output_path=_save("method_comparison"), show=show)
     plot_method_comparison(df, aggregate="per_level", output_path=_save("method_comparison_per_level"), show=show)
-    plot_delay_effect(df, "realtime", output_path=_save("delay_effect_realtime"), show=show)
+    plot_delay_effect(df, method, output_path=_save(f"delay_effect_{method}"), show=show)
     plot_delay_vs_success_by_method(df, output_path=_save("delay_vs_success_by_method"), show=show)
-    plot_per_level_heatmap(df, "realtime", output_path=_save("per_level_heatmap_realtime"), show=show)
+    plot_per_level_heatmap(df, method, output_path=_save(f"per_level_heatmap_{method}"), show=show)
+    if "mean_inference_s" in df.columns:
+        plot_mean_inference_time(df, output_path=_save("mean_inference_time"), show=show)
+    if "total_eval_wall_s" in df.columns:
+        plot_total_eval_wall_time(df, output_path=_save("total_eval_wall_time"), show=show)
 
 
 def main() -> None:
@@ -250,12 +343,17 @@ def main() -> None:
         help="Directory to save figures (if not set, only display)",
     )
     parser.add_argument(
+        "--method",
+        default="realtime",
+        help="Method name to use for single‑method plots (default: realtime)",
+    )
+    parser.add_argument(
         "--no-show",
         action="store_true",
         help="Do not display plots (useful when saving to file on headless systems)",
     )
     args = parser.parse_args()
-    plot_all(args.csv, args.output_dir, show=not args.no_show)
+    plot_all(args.csv, args.output_dir, show=not args.no_show, method=args.method)
 
 
 if __name__ == "__main__":
