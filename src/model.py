@@ -1,6 +1,6 @@
 import dataclasses
 import functools
-from typing import Literal, TypeAlias, Self
+from typing import Callable, Literal, TypeAlias, Self
 
 import einops
 import flax.nnx as nnx
@@ -15,7 +15,7 @@ class ModelConfig:
     token_hidden_dim: int = 64
     num_layers: int = 4
     action_chunk_size: int = 8
-    simulated_delay: int | None = None
+    simulated_delay: int | None = 5
 
 
 def posemb_sincos(pos: jax.Array, embedding_dim: int, min_period: float, max_period: float) -> jax.Array:
@@ -157,16 +157,32 @@ class FlowPolicy(nnx.Module):
         x = self.out_proj(x)
         return x
 
-    def action(self, rng: jax.Array, obs: jax.Array, num_steps: int) -> jax.Array:
+    def action(
+        self,
+        rng: jax.Array,
+        obs: jax.Array,
+        num_steps: int,
+        _profile_callback: Callable[[int, str], None] | None = None,
+    ) -> jax.Array:
         dt = 1 / num_steps
-
-        def step(carry, _):
-            x_t, time = carry
-            v_t = self(obs, x_t, time)
-            return (x_t + dt * v_t, time + dt), None
-
         noise = jax.random.normal(rng, shape=(obs.shape[0], self.action_chunk_size, self.action_dim))
-        (x_1, _), _ = jax.lax.scan(step, (noise, 0.0), length=num_steps)
+        if _profile_callback is not None:
+            jax.debug.callback(_profile_callback, jnp.int32(-1), "prepare_done")
+
+        def step(carry, step_idx):
+            x_t, time = carry
+            if _profile_callback is not None:
+                jax.debug.callback(_profile_callback, step_idx, "step_start")
+            v_t = self(obs, x_t, time)
+            if _profile_callback is not None:
+                jax.debug.callback(_profile_callback, step_idx, "forward_done")
+            next_x = x_t + dt * v_t
+            next_time = time + dt
+            if _profile_callback is not None:
+                jax.debug.callback(_profile_callback, step_idx, "decode_done")
+            return (next_x, next_time), None
+
+        (x_1, _), _ = jax.lax.scan(step, (noise, 0.0), jnp.arange(num_steps))
         assert x_1.shape == (obs.shape[0], self.action_chunk_size, self.action_dim), x_1.shape
         return x_1
 
@@ -226,11 +242,17 @@ class FlowPolicy(nnx.Module):
         prefix_attention_horizon: int,
         prefix_attention_schedule: PrefixAttentionSchedule,
         max_guidance_weight: float,
+        _profile_callback: Callable[[int, str], None] | None = None,
     ) -> jax.Array:
         dt = 1 / num_steps
+        noise = jax.random.normal(rng, shape=(obs.shape[0], self.action_chunk_size, self.action_dim))
+        if _profile_callback is not None:
+            jax.debug.callback(_profile_callback, jnp.int32(-1), "prepare_done")
 
-        def step(carry, _):
+        def step(carry, step_idx):
             x_t, time = carry
+            if _profile_callback is not None:
+                jax.debug.callback(_profile_callback, step_idx, "step_start")
 
             @functools.partial(jax.vmap, in_axes=(0, 0, 0, None))  # over batch
             def pinv_corrected_velocity(obs, x_t, y, t):
@@ -257,10 +279,15 @@ class FlowPolicy(nnx.Module):
                 v_t = self(obs, x_t, time_chunk)
             else:
                 v_t = pinv_corrected_velocity(obs, x_t, prev_action_chunk, time)
-            return (x_t + dt * v_t, time + dt), None
+            if _profile_callback is not None:
+                jax.debug.callback(_profile_callback, step_idx, "forward_done")
+            next_x = x_t + dt * v_t
+            next_time = time + dt
+            if _profile_callback is not None:
+                jax.debug.callback(_profile_callback, step_idx, "decode_done")
+            return (next_x, next_time), None
 
-        noise = jax.random.normal(rng, shape=(obs.shape[0], self.action_chunk_size, self.action_dim))
-        (x_1, _), _ = jax.lax.scan(step, (noise, 0.0), length=num_steps)
+        (x_1, _), _ = jax.lax.scan(step, (noise, 0.0), jnp.arange(num_steps))
         assert x_1.shape == (obs.shape[0], self.action_chunk_size, self.action_dim), x_1.shape
         return x_1
 

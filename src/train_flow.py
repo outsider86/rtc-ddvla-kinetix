@@ -57,6 +57,8 @@ class Config:
     lr_warmup_steps: int = 1000
 
     load_dir: str | None = None
+    num_devices: int | None = None  # If set, use only this many GPUs (e.g. 1 to avoid NCCL multi-GPU errors)
+    run_eval: bool = False  # If False, skip in-epoch eval (e.g. to isolate NCCL errors to eval step)
 
 
 @struct.dataclass
@@ -74,7 +76,14 @@ def main(config: Config):
 
     env = kenv.make_kinetix_env_from_name("Kinetix-Symbolic-Continuous-v1", static_env_params=static_env_params)
 
-    mesh = jax.make_mesh((jax.local_device_count(),), ("level",))
+    # Multi-GPU: same pattern as train_dd.py (no explicit devices= to match working NCCL path)
+    if config.num_devices is not None:
+        n_devices = min(config.num_devices, jax.local_device_count())
+        devices = np.array(jax.local_devices()[:n_devices])
+        mesh = jax.make_mesh((n_devices,), ("level",), devices=devices)
+    else:
+        n_devices = jax.local_device_count()
+        mesh = jax.make_mesh((n_devices,), ("level",))
     sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("level"))
 
     action_chunk_size = config.eval.model.action_chunk_size
@@ -96,14 +105,14 @@ def main(config: Config):
         data = jax.tree.map(
             lambda x: x[:, : (valid_steps // config.batch_size) * config.batch_size + action_chunk_size - 1], data
         )
-        # put on device
+        # put on device (same as train_dd.py)
         data = jax.tree.map(
             lambda x: jax.make_array_from_single_device_arrays(
                 x.shape,
                 sharding,
                 [
                     jax.device_put(y, d)
-                    for y, d in zip(jnp.split(x, jax.local_device_count()), jax.local_devices(), strict=True)
+                    for y, d in zip(jnp.split(x, n_devices), jax.local_devices()[:n_devices], strict=True)
                 ],
             ),
             data,
@@ -154,9 +163,22 @@ def main(config: Config):
         graphdef, train_state = nnx.split((policy, optimizer))
         return EpochCarry(rng, train_state, graphdef)
 
-    @functools.partial(jax.jit, donate_argnums=(0,), in_shardings=sharding, out_shardings=sharding)
-    @jax.vmap
-    def train_epoch(epoch_carry: EpochCarry, level: kenv_state.EnvState, data: generate_data.Data):
+    _eval_metric_keys = ("returned_episode_returns", "returned_episode_lengths", "returned_episode_solved")
+
+    @functools.partial(
+        jax.jit,
+        donate_argnums=(0,),
+        in_shardings=sharding,
+        out_shardings=sharding,
+        static_argnums=(3,),
+    )
+    @functools.partial(jax.vmap, in_axes=(0, 0, 0, None))
+    def train_epoch(
+        epoch_carry: EpochCarry,
+        level: kenv_state.EnvState,
+        data: generate_data.Data,
+        run_eval: bool,
+    ):
         def train_minibatch(carry: tuple[jax.Array, nnx.State], batch_idxs: jax.Array):
             rng, train_state = carry
             policy, optimizer = nnx.merge(epoch_carry.graphdef, train_state)
@@ -196,14 +218,21 @@ def main(config: Config):
             train_minibatch, (epoch_carry.rng, epoch_carry.train_state), permutation
         )
         train_info = jax.tree.map(lambda x: x.mean(), train_info)
-        # eval
+        # eval (can trigger NCCL on multi-GPU; disable with --config.run-eval False to isolate)
         rng, key = jax.random.split(rng)
-        eval_policy, _ = nnx.merge(epoch_carry.graphdef, train_state)
-        eval_info = {}
-        for horizon in range(1, config.eval.model.action_chunk_size + 1):
-            eval_config = dataclasses.replace(config.eval, execute_horizon=horizon)
-            info, _ = _eval.eval(eval_config, env, key, level, eval_policy, env_params, static_env_params)
-            eval_info.update({f"{k}_{horizon}": v for k, v in info.items()})
+        if run_eval:
+            eval_policy, _ = nnx.merge(epoch_carry.graphdef, train_state)
+            eval_info = {}
+            for horizon in range(1, config.eval.model.action_chunk_size + 1):
+                eval_config = dataclasses.replace(config.eval, execute_horizon=horizon)
+                info, _ = _eval.eval(eval_config, env, key, level, eval_policy, env_params, static_env_params)
+                eval_info.update({f"{k}_{horizon}": v for k, v in info.items()})
+        else:
+            eval_info = {
+                f"{k}_{h}": jnp.array(0.0)
+                for k in _eval_metric_keys
+                for h in range(1, config.eval.model.action_chunk_size + 1)
+            }
         video = None
         return EpochCarry(rng, train_state, epoch_carry.graphdef), ({**train_info, **eval_info}, video)
 
@@ -211,8 +240,15 @@ def main(config: Config):
     rng = jax.random.key(config.seed)
     epoch_carry = init(jax.random.split(rng, len(config.level_paths)), state_dicts)
     for epoch_idx in tqdm.tqdm(range(config.num_epochs)):
-        epoch_carry, (info, video) = train_epoch(epoch_carry, levels, data)
+        epoch_carry, (info, video) = train_epoch(
+            epoch_carry, levels, data, config.run_eval
+        )
 
+        # Materialize sharded arrays to host before indexing (avoids NCCL/device errors in logging)
+        info = jax.device_get(info)
+        if video is not None:
+            video = jax.device_get(video)
+        train_state_host = jax.device_get(epoch_carry.train_state)
         for i in range(len(config.level_paths)):
             level_name = config.level_paths[i].replace("/", "_").replace(".json", "")
             wandb.log({f"{level_name}/{k}": v[i] for k, v in info.items()}, step=epoch_idx)
@@ -226,7 +262,7 @@ def main(config: Config):
 
             policy_dir = log_dir / "policies"
             policy_dir.mkdir(parents=True, exist_ok=True)
-            level_train_state = jax.tree.map(lambda x: x[i], epoch_carry.train_state)
+            level_train_state = jax.tree.map(lambda x: x[i], train_state_host)
             with (policy_dir / f"{level_name}.pkl").open("wb") as f:
                 policy, _ = nnx.merge(epoch_carry.graphdef, level_train_state)
                 state_dict = nnx.state(policy).to_pure_dict()

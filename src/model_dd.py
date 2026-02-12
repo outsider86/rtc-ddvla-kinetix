@@ -6,12 +6,14 @@ position with IGNORE_TOKEN (-100) is treated as masked (use MASK embedding, pred
 """
 
 import dataclasses
-from typing import Literal, TypeAlias, Self
+from typing import Callable, Literal, TypeAlias, Self
 
 import einops
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
+
+import time
 
 from model import MLPMixerBlock, get_prefix_weights
 
@@ -207,6 +209,7 @@ class DiscreteDiffusionPolicy(nnx.Module):
         num_steps: int,
         choice_temperature: float = 0.1,
         decode_temperature: float = 1.0,
+        _profile_callback: Callable[[int, str], None] | None = None,
     ) -> jax.Array:
         """MaskGIT-style decode from all-masked input (ref realtime_decode). Gradual unmasking via schedule + top-k.
         temp=0 → deterministic (argmax / lowest-conf unmasking); temp>0 → sampling with that temperature.
@@ -221,12 +224,18 @@ class DiscreteDiffusionPolicy(nnx.Module):
             dtype=jnp.int32,
         )
         unknown_init = jnp.full((B,), L, dtype=jnp.int32)
+        if _profile_callback is not None:
+            jax.debug.callback(_profile_callback, jnp.int32(-1), "prepare_done")
 
         def step(carry, step_idx):
             cur_seqs, rng_state = carry
+            if _profile_callback is not None:
+                jax.debug.callback(_profile_callback, step_idx, "step_start")
             rng_state, cat_key, topk_key = jax.random.split(rng_state, 3)
             # 1) Logits and token prediction
             logits = self(obs, cur_seqs)
+            if _profile_callback is not None:
+                jax.debug.callback(_profile_callback, step_idx, "forward_done")
             if deterministic:
                 sampled = jnp.argmax(logits, axis=-1)
                 # Confidence for mask selection: max logit (high = confident); no temperature scaling needed
@@ -267,6 +276,8 @@ class DiscreteDiffusionPolicy(nnx.Module):
             action_mask = action_mask_flat.reshape(B, self.action_chunk_size, self.action_dim)
             # 6) Next seqs: masked positions keep mask_token_id, rest get sampled
             next_seqs = jnp.where(action_mask, self.mask_token_id, sampled)
+            if _profile_callback is not None:
+                jax.debug.callback(_profile_callback, step_idx, "decode_done")
             return (next_seqs, rng_state), None
 
         (cur_seqs, _), _ = jax.lax.scan(step, (cur_seqs, rng), jnp.arange(num_steps))
@@ -347,10 +358,13 @@ class DiscreteDiffusionPolicy(nnx.Module):
         early_stop: bool = False,
         choice_temperature: float = 0.1,
         decode_temperature: float = 1.0,
+        _profile_callback: Callable[[int, str], None] | None = None,
     ) -> jax.Array:
         """MaskGIT-style decode with fixed prefix (ref realtime_decode). Prefix = first inference_delay steps; rest gradual unmask.
         temp=0 → deterministic (argmax / lowest-conf unmasking); temp>0 → sampling.
         """
+
+        # start_time = time.time()
         deterministic = decode_temperature == 0
         deterministic_choice = choice_temperature == 0
         B = obs.shape[0]
@@ -367,11 +381,20 @@ class DiscreteDiffusionPolicy(nnx.Module):
         )
         use_early_stop = early_stop and execute_horizon is not None
         d_plus_s = (inference_delay + execute_horizon) if use_early_stop else 0
+        if _profile_callback is not None:
+            jax.debug.callback(_profile_callback, jnp.int32(-1), "prepare_done")
 
         def do_step(carry, step_idx):
             cur_seqs, rng_state, early_stopped = carry
+            # step_start_time = time.time()
+            if _profile_callback is not None:
+                jax.debug.callback(_profile_callback, step_idx, "step_start")
             rng_state, cat_key, topk_key = jax.random.split(rng_state, 3)
+            # forward_time = time.time()
+            # print(f"forward_time: {forward_time - step_start_time}")
             logits = self(obs, cur_seqs)
+            if _profile_callback is not None:
+                jax.debug.callback(_profile_callback, step_idx, "forward_done")
             if deterministic:
                 sampled = jnp.argmax(logits, axis=-1)
                 selected_probs = jnp.max(logits, axis=-1)
@@ -415,6 +438,11 @@ class DiscreteDiffusionPolicy(nnx.Module):
                 early_stopped = jnp.logical_or(early_stopped, all_unmasked)
             else:
                 early_stopped = jnp.array(False)
+            # decode_time = time.time()
+            # print(f"decode_time: {decode_time - forward_time}")
+            if _profile_callback is not None:
+                jax.debug.callback(_profile_callback, step_idx, "decode_done")
+            # print(f"total_time: {time.time() - start_time}")
             return (next_seqs, rng_state, early_stopped), None
 
         def step(carry, step_idx):

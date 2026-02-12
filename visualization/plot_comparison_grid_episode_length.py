@@ -1,5 +1,6 @@
-"""Visualization for comparing continuous basemodel vs discrete diffusion results in a grid layout."""
+"""Visualization for comparing continuous basemodel vs discrete diffusion results in a grid layout (episode length)."""
 
+import json
 import pathlib
 from typing import Literal
 
@@ -7,6 +8,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+
+DEFAULT_MAX_TIMESTEPS = 256
 
 
 def _short_level_name(level: str) -> str:
@@ -18,6 +21,48 @@ def load_results(csv_path: str | pathlib.Path) -> pd.DataFrame:
     """Load and preprocess evaluation results CSV."""
     df = pd.read_csv(csv_path)
     df["level_short"] = df["level"].map(_short_level_name)
+    return df
+
+
+def _load_max_timesteps_for_levels(
+    level_paths: list[str],
+    project_root: pathlib.Path,
+) -> dict[str, int]:
+    """Load max_timesteps from each level JSON; return level_short -> max_timesteps. Missing/parse errors use DEFAULT_MAX_TIMESTEPS."""
+    result: dict[str, int] = {}
+    for level_path in level_paths:
+        short = _short_level_name(level_path)
+        if short in result:
+            continue
+        path = project_root / level_path
+        try:
+            if path.exists():
+                with open(path) as f:
+                    data = json.load(f)
+                result[short] = int(data.get("env_params", {}).get("max_timesteps", DEFAULT_MAX_TIMESTEPS))
+            else:
+                result[short] = DEFAULT_MAX_TIMESTEPS
+        except (json.JSONDecodeError, TypeError, KeyError):
+            result[short] = DEFAULT_MAX_TIMESTEPS
+    return result
+
+
+def _add_normalized_episode_length(
+    df: pd.DataFrame,
+    project_root: pathlib.Path,
+) -> pd.DataFrame:
+    """Add normalized_episode_length and episode_length_reciprocal (1/normalized) per level."""
+    if "returned_episode_lengths" not in df.columns:
+        return df
+    level_paths = df["level"].dropna().unique().tolist()
+    max_ts = _load_max_timesteps_for_levels(level_paths, project_root)
+    df["normalized_episode_length"] = df.apply(
+        lambda row: row["returned_episode_lengths"] / max_ts.get(row["level_short"], DEFAULT_MAX_TIMESTEPS),
+        axis=1,
+    )
+    # Final metric: reciprocal (higher = shorter episodes = better)
+    norm = df["normalized_episode_length"]
+    df["episode_length_reciprocal"] = np.where(norm > 0, 1.0 / norm, 0.0)
     return df
 
 
@@ -51,8 +96,12 @@ def _make_sync_baseline(
     levels = base["level_short"].unique()
     delays = sorted(df["delay"].unique())
 
-    # Metrics we propagate if present
-    metric_cols = [c for c in ["returned_episode_solved", "returned_episode_returns"] if c in df.columns]
+    # Metrics we propagate if present (including episode length)
+    metric_cols = [
+        c
+        for c in ["returned_episode_solved", "returned_episode_returns", "returned_episode_lengths"]
+        if c in df.columns
+    ]
 
     for level_short in levels:
         base_level = base[base["level_short"] == level_short]
@@ -100,54 +149,29 @@ def _blend_with_gray(base_color: str, alpha: float) -> str:
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
-def combine_l1_complete(
-    input_dir: str | pathlib.Path = "/scratch/wangpc/rtc-ddvla-kinetix/eval_logs/l1_complete",
-    pattern: str = "results_worker*.csv",
-    output_name: str = "results.csv",
-) -> pathlib.Path:
-    """Combine per-worker CSVs from l1_complete into a single results.csv.
-
-    Adds a `worker_id` column indicating which worker file each row came from.
-    """
-    input_dir = pathlib.Path(input_dir)
-    csv_paths = sorted(input_dir.glob(pattern))
-    if not csv_paths:
-        raise FileNotFoundError(f"No files matching {pattern} in {input_dir}")
-
-    dfs: list[pd.DataFrame] = []
-    for p in csv_paths:
-        df = pd.read_csv(p)
-        # Keep track of which worker this row came from
-        df["worker_id"] = p.stem.replace("results_worker", "")
-        dfs.append(df)
-
-    combined = pd.concat(dfs, ignore_index=True)
-    out_path = input_dir / output_name
-    combined.to_csv(out_path, index=False)
-    print(f"Wrote {out_path} from {len(csv_paths)} files, {len(combined)} rows.")
-    return out_path
-
-
-def plot_comparison_grid(
+def plot_comparison_grid_episode_length(
     continuous_csv: str | pathlib.Path,
     discrete_csv: str | pathlib.Path,
-    metric: Literal["returned_episode_solved", "returned_episode_returns"] = "returned_episode_solved",
     continuous_method: str = "continuousRTC",
     discrete_method: str = "discreteRTC",
     output_path: str | pathlib.Path | None = None,
     show: bool = True,
     show_sync: bool = False,
+    project_root: str | pathlib.Path = ".",
 ) -> None:
-    """Create a grid of plots comparing continuous basemodel vs discrete diffusion results.
+    """Create a grid of plots comparing episode length for continuous basemodel vs discrete diffusion results.
     
     Creates a 4x4 grid with:
     - Individual environment plots in the first 3 rows and 3 columns
     - "Average Over Environments" plot in bottom-left (spanning 2x2)
     - Remaining environments in the last row
     
-    Uses purple for continuous basemodel and red for discrete diffusion.
+    Uses light green for continuous basemodel and red for discrete diffusion.
     Other methods are shown in faded/grayer colors.
     """
+    project_root = pathlib.Path(project_root)
+    metric = "returned_episode_lengths"
+
     # Use a publication-style template and serif typeface similar to the reference figures.
     sns.set_theme(style="whitegrid", context="talk")
     plt.rcParams.update(
@@ -170,6 +194,10 @@ def plot_comparison_grid(
     # Load both CSV files
     df_continuous_raw = load_results(continuous_csv)
     df_discrete_raw = load_results(discrete_csv)
+
+    # Check if episode length column exists
+    if metric not in df_continuous_raw.columns or metric not in df_discrete_raw.columns:
+        raise ValueError(f"Column '{metric}' not found in one or both CSV files")
 
     # In the continuous setting, rename realtime -> RTC, then prefix with "continuous"
     # so we get method names like "continuousRTC", "continuousnaive", ...
@@ -218,7 +246,12 @@ def plot_comparison_grid(
     df = df.copy()
     df["s"] = df["delay"].apply(lambda d: max(1, d))
     df = df[df["execute_horizon"] == df["s"]].copy()
-    
+
+    # Normalize episode length by max_timesteps from level JSONs; use reciprocal as final metric
+    df = _add_normalized_episode_length(df, project_root)
+    metric = "episode_length_reciprocal"
+    ylabel = "Normalized Throughputs"
+
     # Get all unique levels
     all_levels = sorted(df["level_short"].unique())
     
@@ -227,7 +260,7 @@ def plot_comparison_grid(
     
     # Define color scheme and legend behavior
     # - Color: same per source family
-    #     * continuous*  -> purple
+    #     * continuous*  -> light green
     #     * discrete*    -> red
     # - Alpha: distinguish variants while keeping colors consistent:
     #     RTC: 1.0
@@ -266,7 +299,7 @@ def plot_comparison_grid(
     def get_color_and_alpha(method: str, source: str) -> tuple[str, float]:
         """Return (color, alpha) for a method and source.
 
-        Color is a blend of the family base color (purple/red) and gray, using
+        Color is a blend of the family base color (light green/red) and gray, using
         the same ratio as the alpha for that method.
         """
         alpha = _alpha_for_method(method)
@@ -282,6 +315,11 @@ def plot_comparison_grid(
     # Create figure with 4x4 grid
     fig = plt.figure(figsize=(16, 12))
     gs = fig.add_gridspec(4, 4, hspace=0.3, wspace=0.3)
+    
+    # Reciprocal: y_min = 1; y_max from data so all results are included
+    all_vals = df[metric].replace(0, np.nan).dropna()
+    y_min = 1.0
+    y_max = (all_vals.max() * 1.05) if len(all_vals) > 0 else 2.0
     
     # Create individual environment plots in a 2 x 4 grid (top two rows)
     plot_idx = 0
@@ -321,7 +359,7 @@ def plot_comparison_grid(
                 # keep grid lines but hide tick labels and tick marks.
                 ax.set_xlabel("")
                 ax.set_ylabel("")
-                ax.set_ylim(-0.05, 1.05)
+                ax.set_ylim(y_min, y_max)
                 ax.grid(True, alpha=0.3)
                 ax.tick_params(axis="both", labelbottom=False, labelleft=False, length=0)
                 plot_idx += 1
@@ -374,11 +412,11 @@ def plot_comparison_grid(
     
     ax_avg.set_title("Average Over Environments", fontsize=26, fontweight="bold")
     ax_avg.set_xlabel("Inference Delay, d", fontsize=22, fontweight="bold")
-    ax_avg.set_ylabel("Solve Rate", fontsize=22, fontweight="bold")
+    ax_avg.set_ylabel(ylabel, fontsize=22, fontweight="bold")
     ax_avg.set_xticks([0, 1, 2, 3, 4])
     ax_avg.tick_params(axis="both", labelsize=20)
-    # Focus on the high‑performance regime for the aggregated plot
-    ax_avg.set_ylim(0.45, 0.95)
+    # Fixed y-limits for the large figure to keep scale comparable across tasks
+    ax_avg.set_ylim(3.1, 4.4)
     ax_avg.grid(True, alpha=0.3)
     ax_avg.legend(loc="best", fontsize=20)
     
@@ -419,7 +457,7 @@ def plot_comparison_grid(
         # keep grid lines but hide tick labels and tick marks.
         ax.set_xlabel("")
         ax.set_ylabel("")
-        ax.set_ylim(-0.05, 1.05)
+        ax.set_ylim(y_min, y_max)
         ax.grid(True, alpha=0.3)
         ax.tick_params(axis="both", labelbottom=False, labelleft=False, length=0)
     
@@ -461,10 +499,10 @@ def plot_comparison_grid(
                     )
         ax_solo.set_title("Average Over Environments", fontsize=26, fontweight="bold")
         ax_solo.set_xlabel("Inference Delay, d", fontsize=22, fontweight="bold")
-        ax_solo.set_ylabel("Solve Rate", fontsize=22, fontweight="bold")
+        ax_solo.set_ylabel(ylabel, fontsize=22, fontweight="bold")
         ax_solo.set_xticks([0, 1, 2, 3, 4])
         ax_solo.tick_params(axis="both", labelsize=20)
-        ax_solo.set_ylim(0.45, 0.95)
+        ax_solo.set_ylim(3.1, 4.4)
         ax_solo.grid(True, alpha=0.3)
         ax_solo.legend(loc="best", fontsize=20)
         plt.savefig(avg_path, dpi=150, bbox_inches="tight")
@@ -475,11 +513,11 @@ def plot_comparison_grid(
 
 
 def main() -> None:
-    """CLI entry point for generating comparison grid visualization."""
+    """CLI entry point for generating comparison grid visualization (episode length)."""
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Generate comparison grid plot for continuous basemodel vs discrete diffusion results"
+        description="Generate comparison grid plot for episode length: continuous basemodel vs discrete diffusion results"
     )
     parser.add_argument(
         "--continuous-csv",
@@ -512,27 +550,26 @@ def main() -> None:
         help="Method name to highlight from discrete CSV (after renaming/prefixing, default: discreteRTC)",
     )
     parser.add_argument(
-        "--metric",
-        default="returned_episode_solved",
-        choices=["returned_episode_solved", "returned_episode_returns"],
-        help="Metric to plot (default: returned_episode_solved)",
-    )
-    parser.add_argument(
         "--show-sync",
         action="store_true",
         help="Include Continuous-Sync and Discrete-Sync upper-bound baselines",
     )
+    parser.add_argument(
+        "--project-root",
+        default=".",
+        help="Project root to resolve level JSON paths (default: current directory)",
+    )
     args = parser.parse_args()
-    
-    plot_comparison_grid(
+
+    plot_comparison_grid_episode_length(
         args.continuous_csv,
         args.discrete_csv,
-        metric=args.metric,
         continuous_method=args.continuous_method,
         discrete_method=args.discrete_method,
         output_path=args.output,
         show=not args.no_show,
         show_sync=args.show_sync,
+        project_root=args.project_root,
     )
 
 
