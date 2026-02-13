@@ -59,9 +59,9 @@ class BIDMethodConfig:
 class EvalConfig:
     step: int = -1
     weak_step: int | None = None
-    # num_evals: int = 2048
+    num_evals: int = 2048
     # num_evals: int = 256
-    num_evals: int = 1
+    # num_evals: int = 1
     num_flow_steps: int = 5
 
     inference_delay: int = 0
@@ -534,12 +534,12 @@ def main(
         "worlds/l/hard_lunar_lander.json",
         "worlds/l/mjc_half_cheetah.json",
         "worlds/l/mjc_swimmer.json",
-        # "worlds/l/mjc_walker.json",
-        # "worlds/l/h17_unicycle.json",
-        # "worlds/l/chain_lander.json",
-        # "worlds/l/catcher_v3.json",
-        # "worlds/l/trampoline.json",
-        # "worlds/l/car_launch.json",
+        "worlds/l/mjc_walker.json",
+        "worlds/l/h17_unicycle.json",
+        "worlds/l/chain_lander.json",
+        "worlds/l/catcher_v3.json",
+        "worlds/l/trampoline.json",
+        "worlds/l/car_launch.json",
     ),
     seed: int = 0,
     output_dir: str | None = "eval_output",

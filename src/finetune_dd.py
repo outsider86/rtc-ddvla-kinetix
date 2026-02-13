@@ -54,7 +54,7 @@ class Config:
         "worlds/l/car_launch.json",
     )
     batch_size: int = 512
-    num_epochs: int = 16  # Fewer epochs for fine-tuning
+    num_epochs: int = 8  # Fewer epochs for fine-tuning
     seed: int = 0
 
     # Eval during training
