@@ -32,6 +32,7 @@ import tyro
 
 import model_dd as _model_dd
 import train_expert
+import compute_robot_indices
 
 
 @dataclasses.dataclass(frozen=True)
@@ -42,17 +43,32 @@ class NaiveMethodConfig:
 @dataclasses.dataclass(frozen=True)
 class RealtimeMethodConfig:
     early_stop: bool = False
+    adaptive_unmasking: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
 class DiscreteRTCConfig:
     early_stop: bool = True
+    adaptive_unmasking: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class AdaptiveDiscreteRTCConfig:
+    """Discrete RTC with adaptive_unmasking=True (fewer steps when fewer tokens unknown)."""
+    early_stop: bool = True
+    adaptive_unmasking: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
 class BIDMethodConfig:
     n_samples: int = 16
     bid_k: int | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class VlashMethodConfig:
+    """VLASH-style future-state conditioning for discrete diffusion (no extra noise modelling)."""
+    pass
 
 
 @dataclasses.dataclass(frozen=True)
@@ -66,7 +82,7 @@ class EvalConfig:
 
     inference_delay: int = 0
     execute_horizon: int = 1
-    method: NaiveMethodConfig | RealtimeMethodConfig | DiscreteRTCConfig | BIDMethodConfig = NaiveMethodConfig()
+    method: NaiveMethodConfig | RealtimeMethodConfig | DiscreteRTCConfig | AdaptiveDiscreteRTCConfig | BIDMethodConfig | VlashMethodConfig = NaiveMethodConfig()
 
     # Eval-time decode temperature (not a model parameter); used when sampling which positions to unmask (if deterministic_choice=False).
     # 0.1 gives a good balance; temp=0 implicitly sets deterministic_choice=True.
@@ -96,6 +112,8 @@ def _eval_config_to_dict(
         d["method"] = {"type": "realtime", **dataclasses.asdict(m)}
     elif isinstance(m, DiscreteRTCConfig):
         d["method"] = {"type": "discrete_rtc", **dataclasses.asdict(m)}
+    elif isinstance(m, AdaptiveDiscreteRTCConfig):
+        d["method"] = {"type": "adaptive_discrete_rtc", **dataclasses.asdict(m)}
     elif isinstance(m, BIDMethodConfig):
         d["method"] = {"type": "bid", **dataclasses.asdict(m)}
     else:
@@ -107,7 +125,7 @@ def _eval_config_to_dict(
     d["sweep"] = {
         "inference_delays": [0, 1, 2, 3, 4],
         "execute_horizon": "max(1, inference_delay)",
-        "methods": ["naive", "discrete_rtc", "bid"],
+        "methods": ["naive", "discrete_rtc", "adaptive_discrete_rtc", "bid", "vlash"],
     }
     return d
 
@@ -174,6 +192,7 @@ def _benchmark_inference_s(
 
     def run_realtime():
         k, _ = jax.random.split(rng)
+        m = config.method
         return policy.realtime_action(
             k,
             obs,
@@ -181,7 +200,8 @@ def _benchmark_inference_s(
             action_chunk,
             config.inference_delay,
             config.execute_horizon,
-            False,
+            m.early_stop,
+            adaptive_unmasking=m.adaptive_unmasking,
             choice_temperature=ct,
             decode_temperature=dt,
         )
@@ -208,16 +228,29 @@ def _benchmark_inference_s(
             jax.random.key(0), obs, config.num_flow_steps,
             choice_temperature=ct, decode_temperature=dt, _profile_callback=cb,
         )
-    elif isinstance(config.method, (RealtimeMethodConfig, DiscreteRTCConfig)):
+    elif isinstance(config.method, (RealtimeMethodConfig, DiscreteRTCConfig, AdaptiveDiscreteRTCConfig)):
         fn = run_realtime
+        m = config.method
         fn_with_profile = lambda cb: policy.realtime_action(
             jax.random.key(0), obs, config.num_flow_steps,
-            action_chunk, config.inference_delay, config.execute_horizon, False,
+            action_chunk, config.inference_delay, config.execute_horizon, m.early_stop,
+            adaptive_unmasking=m.adaptive_unmasking,
             choice_temperature=ct, decode_temperature=dt, _profile_callback=cb,
         )
     elif isinstance(config.method, BIDMethodConfig):
         fn = run_bid
         fn_with_profile = None
+    elif isinstance(config.method, VlashMethodConfig):
+        # VLASH uses the same core action() kernel; treat as naive for timing.
+        fn = run_naive
+        fn_with_profile = lambda cb: policy.action(
+            jax.random.key(0),
+            obs,
+            config.num_flow_steps,
+            choice_temperature=ct,
+            decode_temperature=dt,
+            _profile_callback=cb,
+        )
     else:
         raise ValueError(type(config.method))
 
@@ -260,6 +293,7 @@ def eval(
     env_params: kenv_state.EnvParams,
     static_env_params: kenv_state.EnvParams,
     weak_policy: _model_dd.DiscreteDiffusionPolicy | None = None,
+    robot_mask: jax.Array | None = None,
 ):
     env = train_expert.BatchEnvWrapper(
         wrappers.LogWrapper(wrappers.AutoReplayWrapper(train_expert.NoisyActionWrapper(env))), config.num_evals
@@ -281,7 +315,7 @@ def eval(
             next_action_chunk = policy.action(
                 key, obs, config.num_flow_steps, choice_temperature=ct, decode_temperature=dt
             )
-        elif isinstance(config.method, (RealtimeMethodConfig, DiscreteRTCConfig)):
+        elif isinstance(config.method, (RealtimeMethodConfig, DiscreteRTCConfig, AdaptiveDiscreteRTCConfig)):
             prefix_attention_horizon = policy.action_chunk_size - config.execute_horizon
             assert (
                 config.inference_delay <= policy.action_chunk_size
@@ -295,6 +329,7 @@ def eval(
                 config.inference_delay,
                 config.execute_horizon,
                 config.method.early_stop,
+                adaptive_unmasking=config.method.adaptive_unmasking,
                 choice_temperature=ct,
                 decode_temperature=dt,
             )
@@ -315,24 +350,90 @@ def eval(
                 choice_temperature=ct,
                 decode_temperature=dt,
             )
+        elif isinstance(config.method, VlashMethodConfig):
+            # VLASH: simulate future state for delayed actions, then act on mixed future obs.
+            # Use the same RNG stream for simulation as for the first inference_delay env steps
+            # so that NoisyActionWrapper noise matches and simulated future == actual future.
+            assert robot_mask is not None, "robot_mask is required for VlashMethodConfig"
+
+            if config.inference_delay == 0:
+                # Mode 1: no simulation
+                obs_for_policy = obs
+            elif config.inference_delay == 1:
+                # Mode 2: simulate 1 step (no inner scan)
+                step_keys = jax.random.split(rng, config.num_evals + 1)[: config.num_evals]  # (num_evals, 2)
+                actions_0 = action_chunk[:, 0, :]  # (num_evals, action_dim)
+
+                def one_step(key, state, action):
+                    obs_next, next_state, _, _, _ = env._env.step(key, state, action, env_params)
+                    return obs_next, next_state
+
+                obs_future, _ = jax.vmap(one_step)(step_keys, env_state, actions_0)
+                obs_for_policy = jnp.where(robot_mask, obs_future, obs)
+            else:
+                # Mode 3: inference_delay > 1 — simulate d steps with a scan (same pattern as eval_vlash_dd.py)
+                d = config.inference_delay
+                # One RNG per env; inside scan we carry RNG and split each step (no pre-built key array)
+                rngs_sim = jax.random.split(rng, config.num_evals)  # (num_evals, 2)
+
+                @jax.vmap
+                def sim_steps(rng_sim, state, actions_d):
+                    def step(carry, action):
+                        s, r = carry
+                        r, key = jax.random.split(r)
+                        obs_n, s_n, _, _, _ = env._env.step(key, s, action, env_params)
+                        return (s_n, r), obs_n
+
+                    (_, _), obs_seq = jax.lax.scan(step, (state, rng_sim), actions_d)
+                    return obs_seq[-1]
+
+                obs_future = sim_steps(rngs_sim, env_state, action_chunk[:, :d, :])
+                obs_for_policy = jnp.where(robot_mask, obs_future, obs)
+            next_action_chunk = policy.action(
+                key,
+                obs_for_policy,
+                config.num_flow_steps,
+                choice_temperature=ct,
+                decode_temperature=dt,
+            )
         else:
             raise ValueError(f"Unknown method: {config.method}")
 
-        action_chunk_to_execute = jnp.concatenate(
-            [
-                action_chunk[:, : config.inference_delay],
-                next_action_chunk[:, config.inference_delay : config.execute_horizon],
-            ],
-            axis=1,
-        )
-        next_action_chunk = jnp.concatenate(
-            [
-                next_action_chunk[:, config.execute_horizon :],
-                jnp.zeros((obs.shape[0], config.execute_horizon, policy.action_dim)),
-            ],
-            axis=1,
-        )
-        next_n = jnp.concatenate([n[config.execute_horizon :], jnp.zeros(config.execute_horizon, dtype=jnp.int32)])
+        # Build action chunk to execute and shift for next iteration
+        if isinstance(config.method, VlashMethodConfig):
+            # VLASH: next_action_chunk generated with simulated future obs
+            shift = config.execute_horizon - config.inference_delay
+            action_chunk_to_execute = jnp.concatenate(
+                [action_chunk[:, : config.inference_delay], next_action_chunk[:, :shift]],
+                axis=1,
+            )
+            next_action_chunk = jnp.concatenate(
+                [
+                    next_action_chunk[:, shift:],
+                    jnp.zeros((obs.shape[0], shift, policy.action_dim)),
+                ],
+                axis=1,
+            )
+            # Advance by execute_horizon steps (we ran that many env steps), not shift
+            next_n = jnp.concatenate(
+                [n[config.execute_horizon :], jnp.zeros(config.execute_horizon, dtype=jnp.int32)]
+            )
+        else:
+            action_chunk_to_execute = jnp.concatenate(
+                [
+                    action_chunk[:, : config.inference_delay],
+                    next_action_chunk[:, config.inference_delay : config.execute_horizon],
+                ],
+                axis=1,
+            )
+            next_action_chunk = jnp.concatenate(
+                [
+                    next_action_chunk[:, config.execute_horizon :],
+                    jnp.zeros((obs.shape[0], config.execute_horizon, policy.action_dim)),
+                ],
+                axis=1,
+            )
+            next_n = jnp.concatenate([n[config.execute_horizon :], jnp.zeros(config.execute_horizon, dtype=jnp.int32)])
         (rng, next_obs, next_env_state), (dones, env_states, infos) = jax.lax.scan(
             step, (rng, obs, env_state), action_chunk_to_execute.transpose(1, 0, 2)
         )
@@ -430,6 +531,11 @@ def run_eval_chunk(
     action_dim = env.action_space(env_params).shape[0]
     action_chunk_size = config.model.action_chunk_size
 
+    # Robot masks for VLASH
+    robot_masks = jnp.stack(
+        [compute_robot_indices.compute_robot_mask(p, obs_dim) for p in level_paths]
+    )
+
     # One policy for inference timing (same weights as first level)
     benchmark_policy = _model_dd.DiscreteDiffusionPolicy(
         obs_dim=obs_dim,
@@ -448,6 +554,7 @@ def run_eval_chunk(
         level: kenv_state.EnvState,
         state_dict: dict,
         weak_state_dict: dict | None,
+        robot_mask: jax.Array,
     ):
         policy = _model_dd.DiscreteDiffusionPolicy(
             obs_dim=obs_dim,
@@ -464,7 +571,17 @@ def run_eval_chunk(
             weak_policy = nnx.merge(graphdef, state)
         else:
             weak_policy = None
-        eval_info, _ = eval(config, env, rng, level, policy, env_params, static_env_params, weak_policy)
+        eval_info, _ = eval(
+            config,
+            env,
+            rng,
+            level,
+            policy,
+            env_params,
+            static_env_params,
+            weak_policy,
+            robot_mask,
+        )
         return eval_info
 
     rngs = jax.random.split(jax.random.key(seed), len(level_paths))
@@ -474,48 +591,90 @@ def run_eval_chunk(
         for i in range(len(level_paths)):
             level_i = jax.tree.map(lambda x: x[i], levels)
             w = weak_state_dicts[i] if weak_state_dicts is not None else None
-            info = _eval_single(c, rngs[i], level_i, state_dicts[i], w)
+            mask_i = robot_masks[i]
+            info = _eval_single(c, rngs[i], level_i, state_dicts[i], w, mask_i)
             out_list.append(jax.device_get(info))
         return out_list
 
     rows: list[dict] = []
     for inference_delay in [0, 1, 2, 3, 4]:
-    # for inference_delay in [3, 4]:
+    # for inference_delay in [2, 3, 4]:
         execute_horizon_min = max(1, inference_delay)
         # execute_horizon_min = action_chunk_size - inference_delay
-        # execute_horizon_max = action_chunk_size - inference_delay
-        execute_horizon_max = execute_horizon_min
+        execute_horizon_max = action_chunk_size - inference_delay
+        # execute_horizon_max = execute_horizon_min
         for execute_horizon in range(execute_horizon_min, execute_horizon_max + 1):
             print(f"{inference_delay=} {execute_horizon=}")
+            # c = dataclasses.replace(
+            #     config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=NaiveMethodConfig()
+            # )
+            # mean_inference_s = _benchmark_inference_s(benchmark_policy, c, obs_dim, action_dim)
+            # out_list = run_config(c)
+            # for i in range(len(level_paths)):
+            #     row = {"delay": inference_delay, "method": "naive", "level": level_paths[i], "execute_horizon": execute_horizon, "mean_inference_s": mean_inference_s, **out_list[i]}
+            #     rows.append(row)
+            #     if results_path is not None:
+            #         _append_row_to_csv(results_path, row, write_header=(len(rows) == 1))
+
+            # c = dataclasses.replace(
+            #     config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=DiscreteRTCConfig()
+            # )
+            # mean_inference_s = _benchmark_inference_s(benchmark_policy, c, obs_dim, action_dim)
+            # out_list = run_config(c)
+            # for i in range(len(level_paths)):
+            #     row = {"delay": inference_delay, "method": "discrete_rtc", "level": level_paths[i], "execute_horizon": execute_horizon, "mean_inference_s": mean_inference_s, **out_list[i]}
+            #     rows.append(row)
+            #     if results_path is not None:
+            #         _append_row_to_csv(results_path, row, write_header=(len(rows) == 1))
+
+            # Adaptive discrete RTC (adaptive_unmasking=True)
             c = dataclasses.replace(
-                config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=NaiveMethodConfig()
+                config,
+                inference_delay=inference_delay,
+                execute_horizon=execute_horizon,
+                method=AdaptiveDiscreteRTCConfig(),
             )
             mean_inference_s = _benchmark_inference_s(benchmark_policy, c, obs_dim, action_dim)
             out_list = run_config(c)
             for i in range(len(level_paths)):
-                row = {"delay": inference_delay, "method": "naive", "level": level_paths[i], "execute_horizon": execute_horizon, "mean_inference_s": mean_inference_s, **out_list[i]}
+                row = {
+                    "delay": inference_delay,
+                    "method": "adaptive_discrete_rtc",
+                    "level": level_paths[i],
+                    "execute_horizon": execute_horizon,
+                    "mean_inference_s": mean_inference_s,
+                    **out_list[i],
+                }
                 rows.append(row)
                 if results_path is not None:
                     _append_row_to_csv(results_path, row, write_header=(len(rows) == 1))
 
-            c = dataclasses.replace(
-                config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=DiscreteRTCConfig()
-            )
-            mean_inference_s = _benchmark_inference_s(benchmark_policy, c, obs_dim, action_dim)
-            out_list = run_config(c)
-            for i in range(len(level_paths)):
-                row = {"delay": inference_delay, "method": "discrete_rtc", "level": level_paths[i], "execute_horizon": execute_horizon, "mean_inference_s": mean_inference_s, **out_list[i]}
-                rows.append(row)
-                if results_path is not None:
-                    _append_row_to_csv(results_path, row, write_header=(len(rows) == 1))
+            # c = dataclasses.replace(
+            #     config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=BIDMethodConfig()
+            # )
+            # mean_inference_s = _benchmark_inference_s(benchmark_policy, c, obs_dim, action_dim)
+            # out_list = run_config(c)
+            # for i in range(len(level_paths)):
+            #     row = {"delay": inference_delay, "method": "bid", "level": level_paths[i], "execute_horizon": execute_horizon, "mean_inference_s": mean_inference_s, **out_list[i]}
+            #     rows.append(row)
+            #     if results_path is not None:
+            #         _append_row_to_csv(results_path, row, write_header=(len(rows) == 1))
 
+            # VLASH (future-state-aware chunk generation)
             c = dataclasses.replace(
-                config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=BIDMethodConfig()
+                config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=VlashMethodConfig()
             )
             mean_inference_s = _benchmark_inference_s(benchmark_policy, c, obs_dim, action_dim)
             out_list = run_config(c)
             for i in range(len(level_paths)):
-                row = {"delay": inference_delay, "method": "bid", "level": level_paths[i], "execute_horizon": execute_horizon, "mean_inference_s": mean_inference_s, **out_list[i]}
+                row = {
+                    "delay": inference_delay,
+                    "method": "vlash",
+                    "level": level_paths[i],
+                    "execute_horizon": execute_horizon,
+                    "mean_inference_s": mean_inference_s,
+                    **out_list[i],
+                }
                 rows.append(row)
                 if results_path is not None:
                     _append_row_to_csv(results_path, row, write_header=(len(rows) == 1))

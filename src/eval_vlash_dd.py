@@ -10,11 +10,11 @@ import flax.nnx as nnx
 import jax
 from jax.experimental import shard_map
 import jax.numpy as jnp
-import kinetix.environment.env as kenv
-import kinetix.environment.env_state as kenv_state
-import kinetix.environment.wrappers as wrappers
-import kinetix.render.renderer_pixels as renderer_pixels
-import pandas as pd
+import kinetix.environment.env as kenv                          # type: ignore
+import kinetix.environment.env_state as kenv_state              # type: ignore
+import kinetix.environment.wrappers as wrappers                 # type: ignore
+import kinetix.render.renderer_pixels as renderer_pixels        # type: ignore
+import pandas as pd                                        
 from tqdm import tqdm
 import tyro
 
@@ -31,8 +31,15 @@ class NaiveMethodConfig:
 @dataclasses.dataclass(frozen=True)
 class RealtimeMethodConfig:
     """Realtime decode for discrete diffusion (uses DD realtime_action; fields kept for CLI compatibility)."""
+    early_stop: bool = False
     prefix_attention_schedule: str = "exp"
     max_guidance_weight: float = 5.0
+
+
+@dataclasses.dataclass(frozen=True)
+class DiscreteRTCConfig:
+    """Discrete RTC method (realtime_action with early_stop=True)."""
+    early_stop: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -62,7 +69,7 @@ class EvalConfig:
 
     inference_delay: int = 0
     execute_horizon: int = 1
-    method: NaiveMethodConfig | RealtimeMethodConfig | BIDMethodConfig | VLASHMethodConfig | OracleMethodConfig = NaiveMethodConfig()
+    method: NaiveMethodConfig | RealtimeMethodConfig | DiscreteRTCConfig | BIDMethodConfig | VLASHMethodConfig | OracleMethodConfig = NaiveMethodConfig()
 
     # Discrete diffusion model config
     model: _model_dd.ModelConfig = _model_dd.ModelConfig()
@@ -106,11 +113,12 @@ def eval(
                 choice_temperature=ct,
                 decode_temperature=dt,
             )
-        elif isinstance(config.method, RealtimeMethodConfig):
+        elif isinstance(config.method, (RealtimeMethodConfig, DiscreteRTCConfig)):
+            prefix_attention_horizon = policy.action_chunk_size - config.execute_horizon
             assert (
                 config.inference_delay <= policy.action_chunk_size
-                and config.execute_horizon <= policy.action_chunk_size
-            ), f"{config.inference_delay=} {config.execute_horizon=} {policy.action_chunk_size=}"
+                and prefix_attention_horizon <= policy.action_chunk_size
+            ), f"{config.inference_delay=} {prefix_attention_horizon=} {policy.action_chunk_size=}"
             next_action_chunk = policy.realtime_action(
                 key,
                 obs,
@@ -118,7 +126,7 @@ def eval(
                 action_chunk,
                 config.inference_delay,
                 config.execute_horizon,
-                False,
+                config.method.early_stop,
                 choice_temperature=ct,
                 decode_temperature=dt,
             )
@@ -219,7 +227,13 @@ def eval(
     rng, key = jax.random.split(rng)
     obs, env_state = env.reset_to_level(key, level, env_params)
     rng, key = jax.random.split(rng)
-    action_chunk = policy.action(key, obs, config.num_flow_steps)  # [batch, horizon, action_dim]
+    action_chunk = policy.action(
+        key,
+        obs,
+        config.num_flow_steps,
+        choice_temperature=config.choice_temperature,
+        decode_temperature=config.decode_temperature,
+    )  # [batch, horizon, action_dim]
     n = jnp.ones(action_chunk.shape[1], dtype=jnp.int32)
     scan_length = math.ceil(env_params.max_timesteps / config.execute_horizon)
     _, (dones, env_states, infos) = jax.lax.scan(
@@ -238,6 +252,9 @@ def eval(
     for key in ["match"]:
         if key in infos:
             return_info[key] = jnp.mean(infos[key])
+    # Average task completion time (seconds): mean episode length * step duration (discrete diffusion eval compatibility)
+    step_duration_s = float(env_params.dt) * int(static_env_params.frame_skip)
+    return_info["mean_task_completion_time_s"] = return_info["returned_episode_lengths"] * step_duration_s
     video = render_video(jax.tree.map(lambda x: x[:, 0], env_states))
     return return_info, video
 
@@ -339,7 +356,8 @@ def main(
     for delay, horizon, method_name in tqdm(all_tasks, desc=desc, ncols=80):
         method_config = {
             "naive": NaiveMethodConfig(),
-            "realtime": RealtimeMethodConfig(),
+            "realtime": RealtimeMethodConfig(early_stop=False),
+            "discrete_rtc": DiscreteRTCConfig(early_stop=True),
             "bid": BIDMethodConfig(),
             "vlash": VLASHMethodConfig(with_noise=False),
             "vlash_w_noise": VLASHMethodConfig(with_noise=True),

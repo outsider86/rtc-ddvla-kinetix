@@ -1,6 +1,7 @@
 import concurrent.futures
 import dataclasses
 import functools
+import json
 import pathlib
 import pickle
 from typing import Sequence
@@ -11,8 +12,8 @@ import flax.nnx as nnx
 import imageio
 import jax
 import jax.numpy as jnp
-import kinetix.environment.env as kenv
-import kinetix.environment.env_state as kenv_state
+import kinetix.environment.env as kenv                          # type: ignore
+import kinetix.environment.env_state as kenv_state              # type: ignore
 import numpy as np
 import optax
 import tqdm_loggable.auto as tqdm
@@ -25,7 +26,8 @@ import model_dd as _model_dd
 import train_expert
 import compute_robot_indices
 
-WANDB_PROJECT = "rtc-kinetix-bc"
+WANDB_PROJECT = "rtc-kinetix-vlash"
+LOG_DIR = pathlib.Path("logs-vlash-dd")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -48,17 +50,25 @@ class Config:
     batch_size: int = 512
     num_epochs: int = 32
     seed: int = 0
-    output_dir: str = "logs-bc"
+    output_dir: str | None = None  # If None, use LOG_DIR / wandb.run.name
 
-    eval: _eval.EvalConfig = _eval.EvalConfig()
-    # Discrete diffusion model config (separate from eval_flow.EvalConfig.model)
+    # Eval during training (same structure as train_dd)
+    eval_num_evals: int = 128
+    eval_num_flow_steps: int = 5
+    eval_inference_delay: int = 0
+    eval_execute_horizon: int = 1
     eval_model: _model_dd.ModelConfig = dataclasses.field(default_factory=_model_dd.ModelConfig)
 
     learning_rate: float = 3e-4
     grad_norm_clip: float = 10.0
     weight_decay: float = 1e-2
-    lr_warmup_steps: int = 1000
-    async_interval: int = 0  # If > 0, randomly delay actions by 0 to async_interval-1 steps
+    lr_warmup_steps: int = 2000
+    use_cosine_decay: bool = True
+    lr_min: float = 1e-5
+
+    load_dir: str | None = None
+    # Async-augmented (VLASH) training: if > 0, randomly delay obs by [0, async_interval) and mix robot@future + env@current
+    async_interval: int = 0
 
 
 @struct.dataclass
@@ -69,15 +79,11 @@ class EpochCarry:
 
 
 def _make_eval_config(config: Config, execute_horizon: int) -> _eval.EvalConfig:
-    """Build eval_flow.EvalConfig for a given execute_horizon, using Naive method and DD model config.
-
-    eval_flow.EvalConfig.model is typed for FlowPolicy, but only action_chunk_size is used;
-    DiscreteDiffusionPolicy matches that interface, so we safely pass eval_model here.
-    """
+    """Build eval_flow.EvalConfig for a given execute_horizon (same as train_dd)."""
     return _eval.EvalConfig(
-        num_evals=config.eval.num_evals,
-        num_flow_steps=config.eval.num_flow_steps,
-        inference_delay=config.eval.inference_delay,
+        num_evals=config.eval_num_evals,
+        num_flow_steps=config.eval_num_flow_steps,
+        inference_delay=config.eval_inference_delay,
         execute_horizon=execute_horizon,
         method=_eval.NaiveMethodConfig(),
         model=config.eval_model,  # type: ignore[arg-type]
@@ -97,24 +103,22 @@ def main(config: Config):
 
     action_chunk_size = config.eval_model.action_chunk_size
 
-    # load data
+    # load data (same as train_dd, with extra reserve for async_interval)
     def load_data(level_path: str):
         level_name = level_path.replace("/", "_").replace(".json", "")
+        print("Loading data for level:", level_name)
         return dict(np.load(pathlib.Path(config.run_path) / "data" / f"{level_name}.npz"))
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
         data = list(executor.map(load_data, config.level_paths))
     with jax.default_device(jax.devices("cpu")[0]):
-        # data has shape: (num_levels, num_steps, num_envs, ...)
-        # flatten envs and steps together for learning
         data = jax.tree.map(lambda *x: einops.rearrange(jnp.stack(x), "l s e ... -> l (e s) ..."), *data)
-        # truncate to multiple of batch size (reserve extra for async_interval)
         max_async = max(0, config.async_interval - 1) if config.async_interval > 0 else 0
         valid_steps = data["obs"].shape[1] - action_chunk_size - max_async + 1
         data = jax.tree.map(
-            lambda x: x[:, : (valid_steps // config.batch_size) * config.batch_size + action_chunk_size + max_async - 1], data
+            lambda x: x[:, : (valid_steps // config.batch_size) * config.batch_size + action_chunk_size + max_async - 1],
+            data,
         )
-        # put on device
         data = jax.tree.map(
             lambda x: jax.make_array_from_single_device_arrays(
                 x.shape,
@@ -133,16 +137,27 @@ def main(config: Config):
     obs_dim = data.obs.shape[-1]
     action_dim = env.action_space(env_params).shape[0]
 
-    # Compute robot masks for async training
+    num_batches = valid_steps // config.batch_size
+    total_steps = config.num_epochs * num_batches
+
+    if config.load_dir is not None:
+        state_dicts = []
+        for level_path in config.level_paths:
+            level_name = level_path.replace("/", "_").replace(".json", "")
+            with (pathlib.Path(config.load_dir) / "policies" / f"{level_name}.pkl").open("rb") as f:
+                state_dicts.append(pickle.load(f))
+        state_dicts = jax.device_put(jax.tree.map(lambda *x: jnp.array(x), *state_dicts))
+    else:
+        state_dicts = None
+
+    # Compute robot masks for async-augmented (VLASH) training
     robot_masks = None
     if config.async_interval > 0:
-        print(f"Async delay augmentation: [0, {config.async_interval})")
+        print(f"Async-augmented (VLASH) training: delay in [0, {config.async_interval})")
         robot_masks = jnp.stack([compute_robot_indices.compute_robot_mask(p, obs_dim) for p in config.level_paths])
         robot_masks = jax.device_put(robot_masks, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("level")))
 
-    @functools.partial(jax.jit, in_shardings=sharding, out_shardings=sharding)
-    @jax.vmap
-    def init(rng: jax.Array) -> EpochCarry:
+    def _init_body(rng: jax.Array, state_dict: dict | None, total_steps: int) -> EpochCarry:
         rng, key = jax.random.split(rng)
         policy = _model_dd.DiscreteDiffusionPolicy(
             obs_dim=obs_dim,
@@ -150,20 +165,54 @@ def main(config: Config):
             config=config.eval_model,
             rngs=nnx.Rngs(key),
         )
+        if state_dict is not None:
+            graphdef, state = nnx.split(policy)
+            state.replace_by_pure_dict(state_dict)
+            policy = nnx.merge(graphdef, state)
         total_params = sum(x.size for x in jax.tree.leaves(nnx.state(policy, nnx.Param)))
         print(f"Total params: {total_params:,}")
+        if config.use_cosine_decay:
+            decay_steps = max(1, total_steps - config.lr_warmup_steps)
+            lr_schedule = optax.warmup_cosine_decay_schedule(
+                0.0,
+                config.learning_rate,
+                config.lr_warmup_steps,
+                decay_steps,
+                config.lr_min,
+            )
+        else:
+            lr_schedule = optax.warmup_constant_schedule(
+                0, config.learning_rate, config.lr_warmup_steps
+            )
         optimizer = nnx.Optimizer(
             policy,
             optax.chain(
                 optax.clip_by_global_norm(config.grad_norm_clip),
-                optax.adamw(
-                    optax.warmup_constant_schedule(0, config.learning_rate, config.lr_warmup_steps),
-                    weight_decay=config.weight_decay,
-                ),
+                optax.adamw(lr_schedule, weight_decay=config.weight_decay),
             ),
         )
         graphdef, train_state = nnx.split((policy, optimizer))
         return EpochCarry(rng, train_state, graphdef)
+
+    @functools.partial(
+        jax.jit,
+        in_shardings=(sharding, None),
+        out_shardings=sharding,
+        static_argnums=(2,),
+    )
+    @functools.partial(jax.vmap, in_axes=(0, None, None))
+    def init_no_load(rng: jax.Array, state_dict: dict | None, total_steps: int) -> EpochCarry:
+        return _init_body(rng, state_dict, total_steps)
+
+    @functools.partial(
+        jax.jit,
+        in_shardings=(sharding, sharding),
+        out_shardings=sharding,
+        static_argnums=(2,),
+    )
+    @functools.partial(jax.vmap, in_axes=(0, 0, None))
+    def init_load(rng: jax.Array, state_dict: dict, total_steps: int) -> EpochCarry:
+        return _init_body(rng, state_dict, total_steps)
 
     @functools.partial(jax.jit, donate_argnums=(0,), in_shardings=sharding, out_shardings=sharding)
     @jax.vmap
@@ -176,31 +225,38 @@ def main(config: Config):
 
             def loss_fn(policy: _model_dd.DiscreteDiffusionPolicy):
                 obs_current = data.obs[batch_idxs]
-                
                 if config.async_interval > 0:
-                    # Sample random delay for each batch element
                     rng_local, key_delay = jax.random.split(key)
                     delays = jax.random.randint(key_delay, (batch_idxs.shape[0],), 0, config.async_interval)
-                    
-                    # Mix: env@current + robot@future
                     obs_future = data.obs[batch_idxs + delays]
                     obs = jnp.where(robot_mask[None, :], obs_future, obs_current)
-                    
-                    # Shift action targets by delay
                     action_indices = batch_idxs[:, None] + delays[:, None] + jnp.arange(action_chunk_size)[None, :]
                 else:
                     rng_local = key
                     obs = obs_current
                     action_indices = batch_idxs[:, None] + jnp.arange(action_chunk_size)[None, :]
-                
                 action_chunks = data.action[action_indices]
                 done_chunks = data.done[action_indices]
-                done_idxs = jnp.where(jnp.any(done_chunks, axis=-1), jnp.argmax(done_chunks, axis=-1), action_chunk_size)
-                action_chunks = jnp.where(jnp.arange(action_chunk_size)[None, :, None] >= done_idxs[:, None, None], 0.0, action_chunks)
-                return policy.loss(rng_local, obs, action_chunks)
+                done_idxs = jnp.where(
+                    jnp.any(done_chunks, axis=-1),
+                    jnp.argmax(done_chunks, axis=-1),
+                    action_chunk_size,
+                )
+                action_chunks = jnp.where(
+                    jnp.arange(action_chunk_size)[None, :, None] >= done_idxs[:, None, None],
+                    0.0,
+                    action_chunks,
+                )
+                loss_total, loss_info = policy.loss(rng_local, obs, action_chunks)
+                return loss_total, loss_info
 
-            loss, grads = nnx.value_and_grad(loss_fn)(policy)
-            info = {"loss": loss, "grad_norm": optax.global_norm(grads)}
+            (loss, loss_info), grads = nnx.value_and_grad(loss_fn, has_aux=True)(policy)
+            info = {
+                "loss": loss,
+                "loss_ce": loss_info["ce_loss"],
+                "loss_l1": loss_info["l1_loss"],
+                "grad_norm": optax.global_norm(grads),
+            }
             optimizer.update(grads)
             _, train_state = nnx.split((policy, optimizer))
             return (rng, train_state), info
@@ -227,22 +283,35 @@ def main(config: Config):
         video = None
         return EpochCarry(rng, train_state, epoch_carry.graphdef), ({**train_info, **eval_info}, video)
 
-    wandb.init(project=WANDB_PROJECT, config=dataclasses.asdict(config))
+    wandb.init(project=WANDB_PROJECT)
+    run_dir = pathlib.Path(config.output_dir) if config.output_dir is not None else LOG_DIR / wandb.run.name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    with (run_dir / "config.json").open("w") as f:
+        json.dump(dataclasses.asdict(config), f, indent=2)
+    with (run_dir / "model_config.json").open("w") as f:
+        json.dump(dataclasses.asdict(config.eval_model), f, indent=2)
+
     rng = jax.random.key(config.seed)
-    epoch_carry = init(jax.random.split(rng, len(config.level_paths)))
-    
-    # Dummy mask if async_interval=0
+    rngs = jax.random.split(rng, len(config.level_paths))
+    if state_dicts is None:
+        epoch_carry = init_no_load(rngs, None, total_steps)
+    else:
+        epoch_carry = init_load(rngs, state_dicts, total_steps)
+
     dummy_masks = jnp.zeros((len(config.level_paths), obs_dim), dtype=bool)
     masks = robot_masks if robot_masks is not None else dummy_masks
-    
+
     for epoch_idx in tqdm.tqdm(range(config.num_epochs)):
         epoch_carry, (info, video) = train_epoch(epoch_carry, levels, data, masks)
+        info = jax.device_get(info)
+        video = jax.device_get(video) if video is not None else None
+        train_state_host = jax.device_get(epoch_carry.train_state)
 
         for i in range(len(config.level_paths)):
             level_name = config.level_paths[i].replace("/", "_").replace(".json", "")
             wandb.log({f"{level_name}/{k}": v[i] for k, v in info.items()}, step=epoch_idx)
 
-            log_dir = pathlib.Path(config.output_dir) / str(epoch_idx)
+            log_dir = run_dir / str(epoch_idx)
 
             if video is not None:
                 video_dir = log_dir / "videos"
@@ -251,7 +320,7 @@ def main(config: Config):
 
             policy_dir = log_dir / "policies"
             policy_dir.mkdir(parents=True, exist_ok=True)
-            level_train_state = jax.tree.map(lambda x: x[i], epoch_carry.train_state)
+            level_train_state = jax.tree.map(lambda x: x[i], train_state_host)
             with (policy_dir / f"{level_name}.pkl").open("wb") as f:
                 policy, _ = nnx.merge(epoch_carry.graphdef, level_train_state)
                 state_dict = nnx.state(policy).to_pure_dict()

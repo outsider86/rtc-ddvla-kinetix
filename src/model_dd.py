@@ -356,12 +356,14 @@ class DiscreteDiffusionPolicy(nnx.Module):
         inference_delay: int,
         execute_horizon: int | None = None,
         early_stop: bool = False,
+        adaptive_unmasking: bool = False,
         choice_temperature: float = 0.1,
         decode_temperature: float = 1.0,
         _profile_callback: Callable[[int, str], None] | None = None,
     ) -> jax.Array:
         """MaskGIT-style decode with fixed prefix (ref realtime_decode). Prefix = first inference_delay steps; rest gradual unmask.
         temp=0 → deterministic (argmax / lowest-conf unmasking); temp>0 → sampling.
+        adaptive_unmasking: if True, num_steps = num_steps * unknown_tokens_num / total_tokens_num.
         """
 
         # start_time = time.time()
@@ -376,6 +378,14 @@ class DiscreteDiffusionPolicy(nnx.Module):
             prefix_bins,
             jnp.full_like(prefix_bins, self.mask_token_id, dtype=jnp.int32),
         )
+        if adaptive_unmasking:
+            unknown_tokens_num = jnp.sum(cur_seqs == self.mask_token_id).astype(jnp.float32)
+            total_tokens_num = jnp.float32(cur_seqs.size)
+            effective_num_steps = jnp.maximum(
+                1, (num_steps * unknown_tokens_num / total_tokens_num).astype(jnp.int32)
+            )
+        else:
+            effective_num_steps = num_steps
         unknown_init = jnp.full(
             (B,), (self.action_chunk_size - inference_delay) * self.action_dim, dtype=jnp.int32
         )
@@ -408,11 +418,11 @@ class DiscreteDiffusionPolicy(nnx.Module):
                 selected_probs = jnp.take_along_axis(probs, sampled[..., None], axis=-1).squeeze(-1)
             unknown_map = cur_seqs == self.mask_token_id
             sampled = jnp.where(prefix_mask, prefix_bins, jnp.where(unknown_map, sampled, cur_seqs))
-            ratio = (step_idx + 1.0) / num_steps
+            ratio = (step_idx + 1.0) / effective_num_steps
             mask_ratio = _decode_mask_schedule(ratio, self.decode_schedule)
             mask_len = (unknown_init.astype(jnp.float32) * mask_ratio).astype(jnp.int32)
             mask_len = jnp.clip(mask_len, 1, jnp.maximum(unknown_init - 1, 0))
-            mask_len = jnp.where(step_idx == num_steps - 1, 0, mask_len)
+            mask_len = jnp.where(step_idx == effective_num_steps - 1, 0, mask_len)
             if self.use_remask:
                 p_remask = 1.0 - ratio
                 selected_probs = jnp.where(
@@ -460,7 +470,7 @@ class DiscreteDiffusionPolicy(nnx.Module):
 
         init_early_stopped = jnp.array(False)
         (cur_seqs, _, _), _ = jax.lax.scan(
-            step, (cur_seqs, rng, init_early_stopped), jnp.arange(num_steps)
+            step, (cur_seqs, rng, init_early_stopped), jnp.arange(effective_num_steps)
         )
         return bins_to_continuous(cur_seqs, self.num_bins)
 

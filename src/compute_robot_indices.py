@@ -41,3 +41,18 @@ def compute_robot_mask(level_path: str, obs_dim: int = 679) -> jnp.ndarray:
         mask = mask.at[circle_start + idx * circle_dim:circle_start + (idx + 1) * circle_dim].set(True)
     
     return mask
+
+
+def robot_mask_ratio(level_path: str, obs_dim: int = 679) -> float:
+    """Return the fraction of observation dimensions that are robot (mask True)."""
+    mask = compute_robot_mask(level_path, obs_dim)
+    return float(jnp.sum(mask)) / obs_dim
+
+
+if __name__ == "__main__":
+    import sys
+    path = sys.argv[1] if len(sys.argv) > 1 else "worlds/l/grasp_easy.json"
+    dim = int(sys.argv[2]) if len(sys.argv) > 2 else 679
+    mask = compute_robot_mask(path, dim)
+    n = int(jnp.sum(mask))
+    print(f"level={path} obs_dim={dim} robot_dims={n} ratio={n/dim:.4f} ({100*n/dim:.2f}%)")
