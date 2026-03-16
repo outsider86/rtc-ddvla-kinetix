@@ -601,10 +601,11 @@ def run_eval_chunk(
     # for inference_delay in [2, 3, 4]:
         execute_horizon_min = max(1, inference_delay)
         # execute_horizon_min = action_chunk_size - inference_delay
-        execute_horizon_max = action_chunk_size - inference_delay
-        # execute_horizon_max = execute_horizon_min
+        # execute_horizon_max = action_chunk_size - inference_delay
+        execute_horizon_max = execute_horizon_min
         for execute_horizon in range(execute_horizon_min, execute_horizon_max + 1):
             print(f"{inference_delay=} {execute_horizon=}")
+            # Naive
             # c = dataclasses.replace(
             #     config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=NaiveMethodConfig()
             # )
@@ -616,16 +617,17 @@ def run_eval_chunk(
             #     if results_path is not None:
             #         _append_row_to_csv(results_path, row, write_header=(len(rows) == 1))
 
-            # c = dataclasses.replace(
-            #     config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=DiscreteRTCConfig()
-            # )
-            # mean_inference_s = _benchmark_inference_s(benchmark_policy, c, obs_dim, action_dim)
-            # out_list = run_config(c)
-            # for i in range(len(level_paths)):
-            #     row = {"delay": inference_delay, "method": "discrete_rtc", "level": level_paths[i], "execute_horizon": execute_horizon, "mean_inference_s": mean_inference_s, **out_list[i]}
-            #     rows.append(row)
-            #     if results_path is not None:
-            #         _append_row_to_csv(results_path, row, write_header=(len(rows) == 1))
+            # Discrete RTC
+            c = dataclasses.replace(
+                config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=DiscreteRTCConfig()
+            )
+            mean_inference_s = _benchmark_inference_s(benchmark_policy, c, obs_dim, action_dim)
+            out_list = run_config(c)
+            for i in range(len(level_paths)):
+                row = {"delay": inference_delay, "method": "discrete_rtc", "level": level_paths[i], "execute_horizon": execute_horizon, "mean_inference_s": mean_inference_s, **out_list[i]}
+                rows.append(row)
+                if results_path is not None:
+                    _append_row_to_csv(results_path, row, write_header=(len(rows) == 1))
 
             # Adaptive discrete RTC (adaptive_unmasking=True)
             c = dataclasses.replace(
@@ -649,6 +651,7 @@ def run_eval_chunk(
                 if results_path is not None:
                     _append_row_to_csv(results_path, row, write_header=(len(rows) == 1))
 
+            # BID
             # c = dataclasses.replace(
             #     config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=BIDMethodConfig()
             # )
@@ -661,23 +664,23 @@ def run_eval_chunk(
             #         _append_row_to_csv(results_path, row, write_header=(len(rows) == 1))
 
             # VLASH (future-state-aware chunk generation)
-            c = dataclasses.replace(
-                config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=VlashMethodConfig()
-            )
-            mean_inference_s = _benchmark_inference_s(benchmark_policy, c, obs_dim, action_dim)
-            out_list = run_config(c)
-            for i in range(len(level_paths)):
-                row = {
-                    "delay": inference_delay,
-                    "method": "vlash",
-                    "level": level_paths[i],
-                    "execute_horizon": execute_horizon,
-                    "mean_inference_s": mean_inference_s,
-                    **out_list[i],
-                }
-                rows.append(row)
-                if results_path is not None:
-                    _append_row_to_csv(results_path, row, write_header=(len(rows) == 1))
+            # c = dataclasses.replace(
+            #     config, inference_delay=inference_delay, execute_horizon=execute_horizon, method=VlashMethodConfig()
+            # )
+            # mean_inference_s = _benchmark_inference_s(benchmark_policy, c, obs_dim, action_dim)
+            # out_list = run_config(c)
+            # for i in range(len(level_paths)):
+            #     row = {
+            #         "delay": inference_delay,
+            #         "method": "vlash",
+            #         "level": level_paths[i],
+            #         "execute_horizon": execute_horizon,
+            #         "mean_inference_s": mean_inference_s,
+            #         **out_list[i],
+            #     }
+            #     rows.append(row)
+            #     if results_path is not None:
+            #         _append_row_to_csv(results_path, row, write_header=(len(rows) == 1))
             # Clear JAX compilation cache to avoid OOM from unbounded growth across (delay, horizon) configs
             jax.clear_caches()
     return rows

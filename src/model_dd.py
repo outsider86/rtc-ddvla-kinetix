@@ -6,6 +6,7 @@ position with IGNORE_TOKEN (-100) is treated as masked (use MASK embedding, pred
 """
 
 import dataclasses
+import logging
 from typing import Callable, Literal, TypeAlias, Self
 
 import einops
@@ -360,6 +361,7 @@ class DiscreteDiffusionPolicy(nnx.Module):
         choice_temperature: float = 0.1,
         decode_temperature: float = 1.0,
         _profile_callback: Callable[[int, str], None] | None = None,
+        _log_early_stop_check: bool = False,
     ) -> jax.Array:
         """MaskGIT-style decode with fixed prefix (ref realtime_decode). Prefix = first inference_delay steps; rest gradual unmask.
         temp=0 → deterministic (argmax / lowest-conf unmasking); temp>0 → sampling.
@@ -371,21 +373,25 @@ class DiscreteDiffusionPolicy(nnx.Module):
         deterministic_choice = choice_temperature == 0
         B = obs.shape[0]
         L = self.action_chunk_size * self.action_dim
+        total_tokens = L
+        unknown_tokens = (self.action_chunk_size - inference_delay) * self.action_dim
+        if adaptive_unmasking:
+            effective_num_steps = max(1, int(num_steps * unknown_tokens / total_tokens))
+            logging.getLogger(__name__).info(
+                "realtime_action adaptive_unmasking: inference_delay=%d, effective_num_steps=%d",
+                inference_delay,
+                effective_num_steps,
+            )
+        else:
+            effective_num_steps = num_steps
         prefix_bins = continuous_to_bins(prev_action_chunk, self.num_bins)
+        # prefix_mask = jnp.arange(self.action_chunk_size)[None, :, None] < (self.action_chunk_size - execute_horizon) # Update, you should load all the previous actions and only execute the last execute_horizon actions are fully unmasked
         prefix_mask = jnp.arange(self.action_chunk_size)[None, :, None] < inference_delay
         cur_seqs = jnp.where(
             prefix_mask,
             prefix_bins,
             jnp.full_like(prefix_bins, self.mask_token_id, dtype=jnp.int32),
         )
-        if adaptive_unmasking:
-            unknown_tokens_num = jnp.sum(cur_seqs == self.mask_token_id).astype(jnp.float32)
-            total_tokens_num = jnp.float32(cur_seqs.size)
-            effective_num_steps = jnp.maximum(
-                1, (num_steps * unknown_tokens_num / total_tokens_num).astype(jnp.int32)
-            )
-        else:
-            effective_num_steps = num_steps
         unknown_init = jnp.full(
             (B,), (self.action_chunk_size - inference_delay) * self.action_dim, dtype=jnp.int32
         )
@@ -469,9 +475,32 @@ class DiscreteDiffusionPolicy(nnx.Module):
             return do_step(carry, step_idx)
 
         init_early_stopped = jnp.array(False)
-        (cur_seqs, _, _), _ = jax.lax.scan(
+        (cur_seqs, _, early_stopped_final), _ = jax.lax.scan(
             step, (cur_seqs, rng, init_early_stopped), jnp.arange(effective_num_steps)
         )
+
+        # Optional: log whether early stop fired and if output has any mask tokens (for debugging)
+        def _log_early_stop_check_cb(seqs, d_plus_s_val, mask_id, early_stopped_flag):
+            # seqs arrives as host array from jax.debug.callback
+            mask_in_critical = (seqs[:, :d_plus_s_val, :] == mask_id).sum()
+            mask_total = (seqs == mask_id).sum()
+            logging.getLogger(__name__).info(
+                "early_stop_check: early_stopped=%s | mask_tokens in critical [:d_plus_s=%d]=%d | mask_tokens total=%d",
+                bool(early_stopped_flag),
+                int(d_plus_s_val),
+                int(mask_in_critical),
+                int(mask_total),
+            )
+
+        if use_early_stop and _log_early_stop_check:
+            jax.debug.callback(
+                _log_early_stop_check_cb,
+                cur_seqs,
+                d_plus_s,
+                self.mask_token_id,
+                early_stopped_final,
+            )
+
         return bins_to_continuous(cur_seqs, self.num_bins)
 
     def apply_mask(self, rng: jax.Array, input_tokens: jax.Array) -> jax.Array:

@@ -565,14 +565,15 @@ def plot_all(
     csv_path: str | pathlib.Path = "eval_logs/results.csv",
     output_dir: str | pathlib.Path | None = None,
     show: bool = True,
-    method: str = "realtime",
+    method: str | None = None,
     project_root: str | pathlib.Path = ".",
 ) -> None:
     """Generate all standard visualizations and optionally save to output_dir.
 
-    The `method` argument controls which method is used for the single‑method plots
-    (heatmaps and delay curves). For datasets without a `realtime` method (e.g.
-    discrete RTC only), pass `method=\"discrete_rtc\"` instead.
+    The `method` argument controls which methods are used for the single-method plots
+    (heatmaps and delay curves). When `method` is None (default), single-method plots
+    are generated for every method/baseline found in the CSV. When `method` is a string
+    (e.g. "discrete_rtc"), only that method's single-method plots are generated.
     Episode length is normalized by max_timesteps from level JSONs when project_root
     is set so level paths in the CSV can be resolved.
     """
@@ -586,37 +587,48 @@ def plot_all(
     def _save(name: str) -> pathlib.Path | None:
         return out / f"{name}.png" if out else None
 
-    plot_solve_rate_by_delay_horizon(
-        df, method, output_path=_save(f"solve_rate_heatmap_{method}"), show=show
-    )
+    # Infer methods for single-method plots: all baselines in CSV when method is None
+    if "method" in df.columns:
+        all_methods = sorted(df["method"].unique().tolist())
+        methods_to_plot = [method] if method is not None and method in all_methods else all_methods
+    else:
+        methods_to_plot = [method] if method is not None else []
+
+    # Single-method plots: one set per method
+    for m in methods_to_plot:
+        plot_solve_rate_by_delay_horizon(
+            df, m, output_path=_save(f"solve_rate_heatmap_{m}"), show=show
+        )
+        plot_delay_effect(df, m, output_path=_save(f"delay_effect_{m}"), show=show)
+        plot_per_level_heatmap(df, m, output_path=_save(f"per_level_heatmap_{m}"), show=show)
+        if "returned_episode_lengths" in df.columns:
+            plot_episode_length_by_delay_horizon(
+                df, m, output_path=_save(f"episode_length_heatmap_{m}"), show=show
+            )
+            plot_episode_length_delay_effect(
+                df, m, output_path=_save(f"episode_length_delay_effect_{m}"), show=show
+            )
+            plot_episode_length_per_level_heatmap(
+                df, m, output_path=_save(f"episode_length_per_level_heatmap_{m}"), show=show
+            )
+
+    # Multi-method comparison plots (include all baselines)
     plot_method_comparison(df, aggregate="all", output_path=_save("method_comparison"), show=show)
     plot_method_comparison(df, aggregate="per_level", output_path=_save("method_comparison_per_level"), show=show)
-    plot_delay_effect(df, method, output_path=_save(f"delay_effect_{method}"), show=show)
     plot_delay_vs_success_by_method(df, output_path=_save("delay_vs_success_by_method"), show=show)
-    plot_per_level_heatmap(df, method, output_path=_save(f"per_level_heatmap_{method}"), show=show)
     if "mean_inference_s" in df.columns:
         plot_mean_inference_time(df, output_path=_save("mean_inference_time"), show=show)
     if "total_eval_wall_s" in df.columns:
         plot_total_eval_wall_time(df, output_path=_save("total_eval_wall_time"), show=show)
-    # Episode length plots
     if "returned_episode_lengths" in df.columns:
-        plot_episode_length_by_delay_horizon(
-            df, method, output_path=_save(f"episode_length_heatmap_{method}"), show=show
-        )
         plot_method_comparison_episode_length(
             df, aggregate="all", output_path=_save("episode_length_method_comparison"), show=show
         )
         plot_method_comparison_episode_length(
             df, aggregate="per_level", output_path=_save("episode_length_method_comparison_per_level"), show=show
         )
-        plot_episode_length_delay_effect(
-            df, method, output_path=_save(f"episode_length_delay_effect_{method}"), show=show
-        )
         plot_episode_length_vs_delay_by_method(
             df, output_path=_save("episode_length_vs_delay_by_method"), show=show
-        )
-        plot_episode_length_per_level_heatmap(
-            df, method, output_path=_save(f"episode_length_per_level_heatmap_{method}"), show=show
         )
 
 
@@ -637,8 +649,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--method",
-        default="realtime",
-        help="Method name to use for single‑method plots (default: realtime)",
+        default=None,
+        help="Method name for single-method plots only; if omitted, plot all baselines in the CSV",
     )
     parser.add_argument(
         "--no-show",
